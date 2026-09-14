@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.py[cod]
+__marimo__/
+.marimo/
+.DS_Store
