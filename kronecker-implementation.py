@@ -1,1082 +1,1799 @@
 import marimo
 
-__generated_with = "0.24.2"
-app = marimo.App(width="medium")
+__generated_with = "0.24.0"
+app = marimo.App(width="medium", auto_download=["html"])
 
 
 @app.cell
 def _():
-    import html
-    import math
-    import time
-    from dataclasses import dataclass
-
-    import marimo as mo
-    import tiktoken
     import torch
     import torch.nn as nn
-    import torch.nn.functional as F
+    import marimo as mo
+    import math
 
-    return F, dataclass, html, math, mo, nn, tiktoken, time, torch
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    # From a normal LLM to Kronecker Embeddings
-
-    This notebook builds the **same tiny decoder-only language model twice**:
-
-    1. a normal model using a learned token lookup table, and
-    2. a Kronecker model using a fixed byte-position codec followed by one learned projection.
-
-    The tokenizer, positional embeddings, attention blocks, MLPs, normalization, and output head are the same. Only the **input token representation** changes.
-
-    > The models here are intentionally untrained. Their predictions are random; the useful comparison is the data flow, shapes, geometry, gradients, parameter counts, and runtime.
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _(html, mo):
-    def html_table(headers, rows):
-        header_html = "".join(
-            f"<th>{html.escape(str(h))}</th>" for h in headers
-        )
-        row_html = "".join(
-            "<tr>"
-            + "".join(f"<td>{html.escape(str(v))}</td>" for v in row)
-            + "</tr>"
-            for row in rows
-        )
-        return mo.Html(f"""
-        <div style="overflow:auto;border:1px solid #263449;border-radius:14px;background:#0b1220;">
-          <table style="border-collapse:collapse;width:100%;font:13px ui-monospace,monospace;color:#dbeafe;">
-            <thead><tr style="background:#111c30;color:#93c5fd;">{header_html}</tr></thead>
-            <tbody>{row_html}</tbody>
-          </table>
-          <style>th,td{{padding:9px 12px;text-align:left;border-bottom:1px solid #1e2b40;}}</style>
-        </div>""")
-
-    def info_card(title, body, accent="#38bdf8"):
-        return mo.Html(f"""
-        <div style="border:1px solid #263449;border-left:5px solid {accent};border-radius:14px;
-                    padding:14px 16px;background:#0b1220;color:#dbeafe;font:14px/1.55 system-ui;">
-          <div style="font-weight:750;color:{accent};margin-bottom:4px;">{html.escape(title)}</div>
-          <div>{body}</div>
-        </div>""")
-
-    return html_table, info_card
+    return math, mo, nn, torch
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## 1 · What a normal autoregressive LLM does
+    # From positions to byte-structured language models
 
-    An LLM repeatedly solves one task: **given all previous tokens, assign a probability to the next token**.
+    We start with two small embedding experiments, then compare three language models on the same text. The result tables are saved observations; the training cells are recipes for new runs.
 
-    ### Symbols used throughout
+    ## Contents
 
-    | Symbol | Meaning |
-    |---|---|
-    | $B$ | batch size: number of sequences processed together |
-    | $T$ | sequence length: number of tokens in each sequence |
-    | $V$ | vocabulary size: number of possible token IDs |
-    | $d_{model}$ | width of every vector flowing through the transformer |
-    | $x \in \mathbb{N}^{B\times T}$ | integer token-ID tensor |
-    | $E \in \mathbb{R}^{V\times d_{model}}$ | normal learned embedding table |
-    | $D$ | Kronecker codec width, $D=d_c d_p$ |
-    | $d_c$ | number of byte values, always 256 |
-    | $d_p$ | maximum byte positions kept from one token |
+    1. [Token and sequence positions](#token-and-sequence-positions) — why an embedding also needs a location in the sentence.
+    2. [Byte-position Kronecker codec](#byte-position-kronecker-codec) — how a byte and its location inside a token become one coordinate.
+    3. [Three model interfaces](#three-model-interfaces) — shared Transformer body, different inputs and prediction heads.
+    4. [Tiny Shakespeare pilot](#tiny-shakespeare-pilot) — a quick learning check.
+    5. [FineWeb-Edu comparison](#fineweb-edu-comparison) — a larger three-seed comparison.
+    6. [Capacity and data scale-up](#capacity-and-data-scale-up) — test whether more data and parameters help the byte model.
+    7. [Saved checkpoints](#saved-checkpoints) — where the trained weights were backed up.
 
-    $\mathbb{N}$ means integers. $\mathbb{R}$ means real-valued numbers. A shape such as $B\times T\times d_{model}$ means “one $d_{model}$-dimensional vector for every token in every sequence.”
+    ## Token and sequence positions
+
+    **Objective:** See how token identity and sentence position combine. A token embedding says *what* a token is; a positional vector says *where* it appears. The next cell preserves the sine/cosine formula, followed by your `RegularEmbedding` and calculation scratchpad.
+
+    This sentence position is different from the byte position used later. The comparison models below use a **learned** sentence-position table; their Kronecker codec uses fixed byte positions inside a token or chunk.
     """)
     return
 
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.image(
-        "assets/llm-pipeline.svg",
-        alt="Decoder-only LLM pipeline from tokenization through next-token sampling",
-        width="100%",
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
     mo.md(r"""
-    ## 2 · The usual embedding: learned lookup by identity
+    In this work, we use sine and cosine functions of different frequencies:
 
-    A tokenizer turns text into IDs. The normal embedding layer owns a matrix
+    $$PE_{(pos,2i)} = \sin(pos / 10000^{2i/d_{\text{model}}})$$
 
-    $$E\in\mathbb{R}^{V\times d_{model}}.$$
+    $$PE_{(pos,2i+1)} = \cos(pos / 10000^{2i/d_{\text{model}}})$$
 
-    For token ID $i$, lookup returns row $E[i]$. Initially the rows are random. During training, gradient descent moves the rows whenever their token IDs occur.
+    where $pos$ is the position and $i$ is the dimension.  That is, each
+    dimension of the positional encoding corresponds to a sinusoid.  The
+    wavelengths form a geometric progression from $2\pi$ to $10000 \cdot
+    2\pi$.  We chose this function because we hypothesized it would
+    allow the model to easily learn to attend by relative positions,
+    since for any fixed offset $k$, $PE_{pos+k}$ can be represented as a
+    linear function of $PE_{pos}$.
 
-    $$e_i = E[i]$$
-
-    - $i$: one integer token ID.
-    - $E[i]$: row $i$ of the table.
-    - $e_i\in\mathbb{R}^{d_{model}}$: the vector sent into the transformer.
-
-    The lookup knows only identity: before training, `run` and `runs` have no built-in relationship. Any useful geometry has to be learned from data.
+    In addition, we apply dropout to the sums of the embeddings and the
+    positional encodings in both the encoder and decoder stacks.  For
+    the base model, we use a rate of $P_{drop}=0.1$.
     """)
     return
 
 
-@app.cell(hide_code=True)
-def _(mo):
-    mo.image(
-        "assets/normal-embedding.svg",
-        alt="A token ID selecting one learned row from the normal embedding matrix",
-        width="100%",
-    )
-    return
-
-
 @app.cell
-def _(html_table, tiktoken):
-    BYTE_VALUES = 256
-    MAX_TOKEN_BYTES = 16
-    CODEC_DIM = BYTE_VALUES * MAX_TOKEN_BYTES
-    MODEL_WIDTH = 64
-    CONTEXT_LENGTH = 48
-    N_HEADS = 4
-    N_LAYERS = 2
-    MODEL_SEED = 7
+def _(math, nn, torch):
+    class RegularEmbedding(nn.Module):
+        def __init__(self, vocab_size: int, d_model: int, dropout=0.1):
+            super().__init__()
 
-    encoding = tiktoken.get_encoding("gpt2")
-    VOCAB_SIZE = encoding.n_vocab
+            # d_model will always be a power of 2
 
-    config_summary = {
-        "vocabulary V": VOCAB_SIZE,
-        "model width d_model": MODEL_WIDTH,
-        "byte values d_c": BYTE_VALUES,
-        "positions d_p": MAX_TOKEN_BYTES,
-        "codec width D": CODEC_DIM,
-    }
-    html_table(["quantity", "value"], config_summary.items())
-    return (
-        BYTE_VALUES,
-        CODEC_DIM,
-        CONTEXT_LENGTH,
-        MAX_TOKEN_BYTES,
-        MODEL_SEED,
-        MODEL_WIDTH,
-        N_HEADS,
-        N_LAYERS,
-        VOCAB_SIZE,
-        encoding,
-    )
+            self.dropout = nn.Dropout(p=dropout)
+            self.d_model = d_model
+            self.embed = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
 
+        def forward(self, inp: torch.Tensor):
+            """
+                inp: (seq-len,) <- token inputs
+            """
+            seq_len = inp.shape[-1]
 
-@app.cell(hide_code=True)
-def _(mo):
-    prompt_input = mo.ui.text(
-        value="The model learns from tokens.",
-        label="Try a prompt",
-        full_width=True,
-    )
-    prompt_input
-    return (prompt_input,)
+            # converting tokens into embeddings
+            x = self.embed(inp)
 
+            """
+            idea is to create a matrix of pos which would look like
+               [0, 1, 2, 3.. seq_len]
 
-@app.cell
-def _(CONTEXT_LENGTH, encoding, html_table, mo, prompt_input, torch):
-    prompt_text = prompt_input.value
-    prompt_token_ids = encoding.encode(prompt_text)
-    print("tokenizer output:", prompt_token_ids)
-    prompt_token_rows = [
-        (
-            position,
-            token_id,
-            repr(encoding.decode([token_id])),
-            list(encoding.decode_single_token_bytes(token_id)),
-        )
-        for position, token_id in enumerate(prompt_token_ids)
-    ]
-    print(f"{prompt_token_rows=}")
-    input_ids_tensor = torch.tensor(
-        [prompt_token_ids[:CONTEXT_LENGTH]], dtype=torch.long
-    )
+            and create it in the shape of (seq_len, 1)
 
-    mo.vstack(
-        [
-            mo.md(
-                f"**Tokenized shape:** `{tuple(input_ids_tensor.shape)}` — one batch containing {input_ids_tensor.shape[1]} tokens."
-            ),
-            html_table(
-                ["position", "token ID", "decoded piece", "UTF-8 bytes"],
-                prompt_token_rows,
-            ),
-        ]
-    )
-    return (input_ids_tensor,)
+            and have the second fractional matrix in the shape of (1, d_model)
+            so that we can do a dot product of both to produce (seq_len, d_model)
+            """
+
+            pos = torch.arange(
+                seq_len,
+                dtype=x.dtype,
+                device=x.device
+            ).unsqueeze(1)
+
+            """
+            for computing fractional part
+            fraction = 1 / 10,000 ^ (2i / d) fraction is in terms of 2i here
+            fraction = 10000 ^ -(2i / d)
+            ln(fraction) = -(2i/d) ln(10,000)
+            fraction = e ^ -(2i * ln(10,000) / d)
+            """
+            ind = torch.arange(0, self.d_model, 2, dtype=x.dtype, device=x.device)
+            frac_2i = torch.exp(                      # defining fraction in terms of 2i
+                ind * -1 * math.log(10_000) / self.d_model
+            )
+            # since every 2i, 2i+1 will be the same
+            frac = torch.zeros(self.d_model, dtype=x.dtype, device=x.device)
+            frac[0::2] = frac_2i
+            frac[1::2] = frac_2i
+            frac = frac.unsqueeze(0)  # to convert to a shape of (1, d_model)
+
+            # now we do a dot product
+            positional_embed = pos @ frac # this will give the term inside sin/cos for each element
+            # will be of shape (seq_len, d_model)
+
+            # we do sin and cos on each of the elements
+            positional_embed[:, 0::2] = torch.sin(positional_embed[:, 0::2])
+            positional_embed[:, 1::2] = torch.cos(positional_embed[:, 1::2])
+
+            # adding position_embed to the embeddings
+            return self.dropout(x * math.sqrt(self.d_model) + positional_embed)
 
 
-@app.cell
-def _(torch):
-    def build_gpt2_byte_buffers(tokenizer, max_bytes):
-        byte_buffer = torch.zeros(
-            (tokenizer.n_vocab, max_bytes), dtype=torch.uint8
-        )
-        print(f"shape of byte_buffer={byte_buffer.shape}")
-        length_buffer = torch.zeros(tokenizer.n_vocab, dtype=torch.int16)
-        for token_id in range(tokenizer.n_vocab):
-            raw = tokenizer.decode_single_token_bytes(token_id)
-            clipped = raw[:max_bytes]
-            length_buffer[token_id] = len(clipped)
-            if clipped:
-                byte_buffer[token_id, : len(clipped)] = torch.tensor(
-                    list(clipped), dtype=torch.uint8
-                )
-        return byte_buffer, length_buffer
-
-    return (build_gpt2_byte_buffers,)
-
-
-@app.cell
-def _(encoding):
-    encoding.decode_single_token_bytes(50000)[:16]
-    return
-
-
-@app.cell
-def _(MAX_TOKEN_BYTES, build_gpt2_byte_buffers, encoding, info_card):
-    gpt2_byte_buffer, gpt2_length_buffer = build_gpt2_byte_buffers(
-        encoding, MAX_TOKEN_BYTES
-    )
-    buffer_megabytes = (
-        gpt2_byte_buffer.numel() * gpt2_byte_buffer.element_size()
-        + gpt2_length_buffer.numel() * gpt2_length_buffer.element_size()
-    ) / 1_000_000
-
-    info_card(
-        "Fixed tokenizer buffers created",
-        f"byte_buffer shape = {tuple(gpt2_byte_buffer.shape)}, length_buffer shape = {tuple(gpt2_length_buffer.shape)}. "
-        f"Together they occupy about <b>{buffer_megabytes:.2f} MB</b> and receive no gradients.",
-        "#22d3ee",
-    )
-    return gpt2_byte_buffer, gpt2_length_buffer
-
-
-@app.cell
-def _(gpt2_byte_buffer):
-    bytes(gpt2_byte_buffer[500].tolist()).decode("utf-8")
     return
 
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md(r"""
-    ## 3 · The paper's replacement: byte × position features
+    mo.md("""
+    Your original scratch derivation (kept as text because the last line is unfinished):
 
-    Let a token contain UTF-8 bytes $b=(b_1,\ldots,b_L)$.
+    ```python
+    "\""
+    fraction = 1 / 1e4 ^ (2i / d)
+    fraction = 1e4 ^ -(2i / d)
+    log(fraction) = (-2i /d * 4) ln(10)
+    fraction(2i) = e ^ -(8i * ln(10) / d)
+    fraction(i) = e ^ -(4i * ln(10) / d)
+    "\""
 
-    $$
-    \kappa(b)=\frac{1}{\sqrt L}\sum_{p=1}^{L} c_{b_p}\otimes p_p
-    $$
-
-    Read every symbol as follows:
-
-    - $\kappa$ (“kappa”) is the deterministic codec function.
-    - $b_p$ is the numerical byte value at position $p$.
-    - $L$ is the number of retained bytes in the token.
-    - $c_{b_p}\in\mathbb{R}^{256}$ is a one-hot vector selecting byte value $b_p$.
-    - $p_p\in\mathbb{R}^{d_p}$ is a one-hot vector selecting position $p$.
-    - $\otimes$ is the **Kronecker product**. For two one-hot vectors it simply selects one cell in a byte-by-position grid.
-    - $\sum$ combines the selected cells for all bytes.
-    - $1/\sqrt L$ prevents longer tokens from automatically having a larger vector norm.
-
-    The flattened grid has width
-
-    $$D=d_c d_p=256\times16=4096.$$
-
-    After per-token z-normalization, the only learned input-side operation is
-
-    $$e_i=\kappa(b_i)W_{proj},\qquad W_{proj}\in\mathbb{R}^{D\times d_{model}}.$$
-
-    The projection converts the fixed 4096-dimensional byte-position description into the same $d_{model}$-wide vector expected by an ordinary transformer.
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.image(
-        "assets/kronecker-byte-position.svg",
-        alt="The bytes in the word token activating coordinates in a byte-by-position grid",
-        width="100%",
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ### What the Kronecker product means here
-
-    A Kronecker product combines every entry of one vector with every entry of another. For two short vectors,
-
-    \[
-    [a,b]\otimes[c,d]=[ac,ad,bc,bd].
-    \]
-
-    The paper uses two **one-hot** vectors for every byte at position $p$:
-
-    - $\mathbf{c}_{b_p}\in\mathbb{R}^{256}$ has a 1 at the byte value $b_p$.
-    - $\mathbf{p}_p\in\mathbb{R}^{d_p}$ has a 1 at the byte position $p$.
-
-    Their product $\mathbf{c}_{b_p}\otimes\mathbf{p}_p$ has length $256d_p$ and contains exactly one 1. It identifies one pair: **this byte occurred at this position**.
-
-    For `"cat"`, using zero-based code positions and $d_p=16$:
-
-    ```text
-    byte "c" =  99 at position 0  →  c₉₉  ⊗ p₀  → index  99×16 + 0 = 1584
-    byte "a" =  97 at position 1  →  c₉₇  ⊗ p₁  → index  97×16 + 1 = 1553
-    byte "t" = 116 at position 2  →  c₁₁₆ ⊗ p₂  → index 116×16 + 2 = 1858
+    torch.exp(torch.arange(0, d_model)
     ```
-
-    You can picture the Kronecker output as a $256\times16$ byte-position grid:
-
-    ```text
-                     position
-                   0  1  2  3 ... 15
-    byte 97  (a)   0  1  0  0 ...  0
-    byte 99  (c)   1  0  0  0 ...  0
-    byte 116 (t)   0  0  1  0 ...  0
-    other bytes    0  0  0  0 ...  0
-    ```
-
-    The token codec sums these three one-hot products and gives each active coordinate the value $1/\sqrt{3}$.
-
-    The vectorized implementation does not call `torch.kron`: `flat_indices = byte * pos_dim + position` calculates where each Kronecker-product 1 belongs, and `scatter_add_` writes all those values for the complete batch at once.
     """)
     return
 
 
 @app.cell
-def _(
-    BYTE_VALUES,
-    MAX_TOKEN_BYTES,
-    gpt2_byte_buffer,
-    gpt2_length_buffer,
-    input_ids_tensor,
-    torch,
-):
-    def kronecker_codec(
-        byte_sequences,  # shape: (batch, num-tokens, max-bytes)
-        lengths,  # shape: (batch, num-tokens)
-        char_dim=256,
-        eps=1e-6,
-    ):
-        pos_dim = byte_sequences.shape[-1]
-
-        # preserves the original (batch, num-tokens) from (batch, num-tokens, pos-dim)
-        original_shape = byte_sequences.shape[:-1]
-
-        # remove batch dimension and flatten
-        #   converted (batch, num-tokens, max-bytes) --to--> (batch * num-tokens, max_bytes)
-        flat_bytes = byte_sequences.reshape(-1, pos_dim).long()
-
-        # similarly remove the dimension for flat_lengths
-        #   converted (batch, num-tokens) to (batch * num_tokens, )
-        flat_lengths = lengths.reshape(-1).long().to(byte_sequences.device)
-
-        # batch_size * num-tokens
-        batch_tokens = flat_bytes.shape[0]
-        # max-bytes (acc to paper) * 256
-        codec_dim = char_dim * pos_dim
-
-        """
-            For pos_dim = 4, produces:
-            tensor([0, 1, 2, 3])  # shape (4,)
-            Then:
-            .expand(batch_tokens, -1)
-            repeats that row for every token. If batch_tokens = 3:
-            positions = tensor([
-                [0, 1, 2, 3],
-                [0, 1, 2, 3],
-                [0, 1, 2, 3],
-            ])
-        """
-        positions = torch.arange(pos_dim, device=byte_sequences.device).expand(
-            batch_tokens, -1
-        )  # shape: batch_tokens (batch-size * num-of-tokens), pos_dim
-
-        # positions:    (batch * no-of-tokens, pos_dim)
-        # flat_lengths: (batch * no-of-tokens, 1)
-        # creates a mask for each sequence:
-        #    for each row: all the elements will be true till their length
-        #                  and all the empty places would be filled with false
-        active = positions < flat_lengths.unsqueeze(1)
-
-        # flat_bytes: (batch * num-of-tokens, pos-dim)
-        # pos_dim = 16 (for eg)
-        # positions:  (batch * num-of-tokens, pos-dim)
-        # computes the indexes where we have to put one
-        flat_indices = flat_bytes * pos_dim + positions
-
-        scales = torch.rsqrt(flat_lengths.clamp_min(1).float()).unsqueeze(1)
-        source = active.float() * scales
-        codec = torch.zeros(
-            batch_tokens, codec_dim, device=byte_sequences.device
-        )
-
-        # writes values from source into positions specified by flat_indices
-        codec.scatter_add_(1, flat_indices, source)
-
-        mean = codec.mean(dim=-1, keepdim=True)
-        std = codec.std(dim=-1, keepdim=True) + eps
-        normalized = (codec - mean) / std
-        return normalized.reshape(*original_shape, codec_dim)
-
-    # input_ids_tensor.shape == (batch_size, no_of_tokens)
-    byte_sequences = gpt2_byte_buffer[
-        input_ids_tensor
-    ]  # shape: batch, num_tokens, dp (max bytes -> pos_dim)
-    lengths = gpt2_length_buffer[input_ids_tensor]  # shape: batch, num_tokens
-    char_dim = BYTE_VALUES
-    pos_dim = MAX_TOKEN_BYTES
-
-    (
-        f"{input_ids_tensor.shape=}",
-        f"{byte_sequences.shape=}",
-        f"{lengths.shape=}",
-    )
-    return byte_sequences, kronecker_codec, lengths
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ### A simple loop version for comparison
-
-    This version implements the same codec literally: visit every token, visit every real byte, calculate its flattened `(byte, position)` coordinate, and write `1 / sqrt(length)` there. It is easier to read; the vectorized version is better suited to large GPU batches.
-    """)
-    return
-
-
-@app.cell
-def _(torch):
-    def simple_kronecker_codec(
-        byte_sequences,  # (batch, num_tokens, max_bytes)
-        lengths,  # (batch, num_tokens)
-        char_dim=256,
-        eps=1e-6,
-    ):
-        batch_size, num_tokens, pos_dim = byte_sequences.shape
-        codec_dim = char_dim * pos_dim
-
-        # Start with one empty codec vector for every token.
-        codec = torch.zeros(
-            batch_size,
-            num_tokens,
-            codec_dim,
-            device=byte_sequences.device,
-        )
-
-        for batch_index in range(batch_size):
-            for token_index in range(num_tokens):
-                token_length = int(lengths[batch_index, token_index].item())
-
-                # Equation (1) places 1 / sqrt(L) at each real byte-position pair.
-                scale = 1 / max(token_length, 1) ** 0.5
-
-                for position in range(min(token_length, pos_dim)):
-                    byte_value = int(
-                        byte_sequences[
-                            batch_index, token_index, position
-                        ].item()
-                    )
-
-                    # Flatten grid coordinate (byte_value, position) into one index.
-                    flat_index = byte_value * pos_dim + position
-                    codec[batch_index, token_index, flat_index] = scale
-
-        # Apply the same per-token z-normalization as the vectorized function.
-        mean = codec.mean(dim=-1, keepdim=True)
-        std = codec.std(dim=-1, keepdim=True) + eps
-        return (codec - mean) / std
-
-    return (simple_kronecker_codec,)
-
-
-@app.cell
-def _(byte_sequences, kronecker_codec, lengths, mo, simple_kronecker_codec):
-    _simple_output = simple_kronecker_codec(byte_sequences, lengths)
-    _vectorized_output = kronecker_codec(byte_sequences, lengths)
-    _max_difference = (_simple_output - _vectorized_output).abs().max().item()
-
-    mo.md(
-        f"""
-    **Comparison on the current prompt**
-
-    - Simple output shape: `{tuple(_simple_output.shape)}`
-    - Vectorized output shape: `{tuple(_vectorized_output.shape)}`
-    - Largest element-wise difference: `{_max_difference:.2e}`
-
-    A difference of zero (or tiny floating-point noise) confirms that both implementations construct the same codec.
+def _(math, torch):
+    seq_len = 10
     """
+    0 -> [0, 0, 0, 0, ..](d=16)
+    ..
+    4 -> [4, 4, 4, 4, ..](d=16)
+    """
+    pos = torch.arange(0, seq_len, dtype=float).unsqueeze(1)
+    print("pos part", pos.shape, pos)
+
+    d_model = 16
+    temp = torch.exp(
+        torch.arange(0, d_model//2, dtype=float) * 8 * math.log(10) * -1 / d_model # used 8 instead of 4 because i only want even indices
     )
-    return
+    print(temp.shape, temp)
+    frac = torch.zeros(d_model, dtype=float)
+    frac[0::2] = temp
+    frac[1::2] = temp
+    frac = frac.unsqueeze(0)
+    print("fractional part", frac.shape, frac)
 
+    matrix = pos @ frac
 
-@app.cell
-def _(kronecker_codec, math, nn):
-    class KroneckerEmbedding(nn.Module):
-        def __init__(
-            self, byte_buffer, length_buffer, d_model, char_dim=256, pos_dim=16
-        ):
-            super().__init__()
-            self.char_dim = char_dim
-            self.pos_dim = pos_dim
-            self.codec_dim = char_dim * pos_dim
-            self.num_embeddings = byte_buffer.shape[0]
-            self.embedding_dim = d_model
-            self.register_buffer("byte_buffer", byte_buffer, persistent=False)
-            self.register_buffer(
-                "length_buffer", length_buffer, persistent=False
-            )
-            self.projection = nn.Linear(self.codec_dim, d_model, bias=False)
-            nn.init.normal_(
-                self.projection.weight,
-                mean=0.0,
-                std=1 / math.sqrt(self.codec_dim),
-            )
+    matrix[:, 0::2] = torch.sin(matrix[:, 0::2])
+    matrix[:, 1::2] = torch.cos(matrix[:, 1::2])
 
-        def forward(self, input_ids):
-            token_bytes = self.byte_buffer[input_ids]
-            token_lengths = self.length_buffer[input_ids]
-            fixed_features = kronecker_codec(
-                token_bytes,
-                token_lengths,
-                char_dim=self.char_dim,
-            )
-            return self.projection(
-                fixed_features.to(self.projection.weight.dtype)
-            )
-
-    return (KroneckerEmbedding,)
-
-
-@app.cell
-def _(
-    BYTE_VALUES,
-    CODEC_DIM,
-    gpt2_byte_buffer,
-    gpt2_length_buffer,
-    html_table,
-    input_ids_tensor,
-    kronecker_codec,
-):
-    print(f"raw input tokenized using gpt2 tokenizer: {input_ids_tensor}")
-
-    print(
-        f"length of bytes corresponding to each token: {gpt2_length_buffer[input_ids_tensor]}"
-    )
-    print(f"tensor for each token:", gpt2_byte_buffer[input_ids_tensor])
-
-    sample_codec = kronecker_codec(
-        gpt2_byte_buffer[input_ids_tensor],
-        gpt2_length_buffer[input_ids_tensor],
-        char_dim=BYTE_VALUES,
-    )
-    codec_check_rows = [
-        (
-            "codec shape",
-            tuple(sample_codec.shape),
-            f"[B, T, D] = [1, {input_ids_tensor.shape[1]}, {CODEC_DIM}]",
-        ),
-        (
-            "mean over D",
-            f"{sample_codec.mean(dim=-1).abs().max().item():.2e}",
-            "approximately 0 after z-normalization",
-        ),
-        (
-            "std over D",
-            f"{sample_codec.std(dim=-1).mean().item():.6f}",
-            "approximately 1 after z-normalization",
-        ),
-    ]
-    html_table(["check", "observed", "expected"], codec_check_rows)
+    print("matrix", matrix.shape, matrix)
     return
 
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.image(
-        "assets/embedding-swap.svg",
-        alt="Normal embedding and Kronecker embedding feeding the same transformer",
-        width="100%",
+    mo.md("""
+    ## Byte-position Kronecker codec
+
+    **Objective:** Represent a short byte sequence without a learned vocabulary lookup. For each real byte, combine its value and its position *inside this token*: coordinate `byte * P + position`. The sparse `256P` vector then goes through a learned projection. Your draft class is kept below; its `forward` is still a work in progress.
+    """)
+    return
+
+
+@app.cell
+def _(nn, torch):
+    class KroneckerV1Embedding(nn.Module):
+        def __init__(self, vocab_size: int, d_model: int, dropout=0.1):
+            super().__init__()
+            self.d_model = d_model
+
+        def forward(self, inp: torch.Tensor):
+            """
+                inp: (seq-len,) <- token inputs
+            """
+            seq_len = inp.shape[-1]
+
+        @staticmethod
+        def kronecker_codec(
+            byte_seq,  # shape: (batch, seq-len, max-bytes)
+            lengths,  # shape: (batch, seq-len)
+            char_dim=256,
+            eps=1e-6,
+        ):
+            d_p = byte_seq.shape[-1]
+            device = byte_seq.device
+
+            batch_tokens = byte_seq.shape[0] * byte_seq.shape[1]
+            flat_byte_seq = byte_seq.reshape(batch_tokens, d_p).long()
+            flat_lengths = lengths.reshape(batch_tokens).to(device)
+
+            positions = torch.arange(d_p, device=device)
+            # (batch_tokens, 16) + (1, 16)
+            # clever use of broadcasting
+            indexes = flat_byte_seq * d_p + positions.unsqueeze(0)
+
+            #clever use of broadcasting
+            active = positions.unsqueeze(0) < flat_lengths.unsqueeze(1)
+
+            codec = torch.zeros((batch_tokens, d_p * char_dim), device=device, dtype=torch.float32)
+            source = torch.rsqrt(flat_lengths).unsqueeze(1) * active.float()
+            codec.scatter_add_(1, indexes.to(int), source)
+
+            mean = codec.mean(dim=-1, keepdim=True)
+            std = codec.std(dim=-1, keepdim=True) + eps
+            normalized = (codec - mean) / std
+            return normalized.reshape(*byte_seq.shape[:-1], char_dim * d_p)
+
+
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    First, turn example words into padded byte rows and record their true lengths. The length tells us which zeros are padding; a zero-length row can also mean end of document.
+    """)
+    return
+
+
+@app.cell
+def _(torch):
+    scratch_d_p = 8
+    scratch_char_dim = 256
+    scratch_seq_length = 4
+
+    scratch_str_seq = [
+        ["hello", "world", "from", "revant"],
+        ["some", "other", "string"],
+    ]
+
+    scratch_empty_byte = 0
+
+    scratch_byte_seq = torch.Tensor([
+        (
+            [
+                (list(token.encode()) + [scratch_empty_byte] * scratch_d_p)[:scratch_d_p]
+                for token in seq
+            ] + [[scratch_empty_byte] * scratch_d_p] * scratch_seq_length
+        )[:scratch_seq_length]
+        for seq in scratch_str_seq
+    ])
+
+    scratch_lengths = torch.Tensor([
+        ([len(token) for token in seq] + [0] * scratch_seq_length)[:scratch_seq_length]
+        for seq in scratch_str_seq
+    ])
+
+    print(scratch_byte_seq.shape)
+    print(scratch_byte_seq)
+    print(scratch_lengths.shape)
+    print(scratch_lengths)
+    return scratch_byte_seq, scratch_char_dim, scratch_d_p, scratch_lengths
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    Next, flatten the batch to one row per token. Broadcasting adds the same position row to every byte row, giving each real `(byte, position)` pair its coordinate. The following shape check shows what `unsqueeze(0)` and `unsqueeze(1)` change.
+    """)
+    return
+
+
+@app.cell
+def _(scratch_byte_seq, scratch_d_p, scratch_lengths, torch):
+    scratch_batch_tokens = scratch_byte_seq.shape[0] * scratch_byte_seq.shape[1]
+    scratch_flat_byte_seq = scratch_byte_seq.reshape(scratch_batch_tokens, scratch_d_p)
+    scratch_flat_lengths = scratch_lengths.reshape(scratch_batch_tokens)
+
+    scratch_positions = torch.arange(scratch_d_p)
+    # (batch_tokens, d_p) + (1, d_p): broadcasting across tokens
+    scratch_indexes = scratch_flat_byte_seq * scratch_d_p + scratch_positions.unsqueeze(0)
+    scratch_indexes
+    return (
+        scratch_batch_tokens,
+        scratch_flat_lengths,
+        scratch_indexes,
+        scratch_positions,
     )
+
+
+@app.cell
+def _(scratch_d_p, torch):
+    scratch_positions1 = torch.arange(scratch_d_p)
+    print(scratch_positions1.shape, scratch_positions1.unsqueeze(0).shape, scratch_positions1.unsqueeze(1).shape)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    Compare each position with its token's length to build an **active mask**. A padded byte still has an index, but it must contribute zero to the codec.
+    """)
+    return
+
+
+@app.cell
+def _(scratch_flat_lengths, scratch_positions):
+    # Positions have shape (1, d_p); lengths have shape (batch_tokens, 1).
+    scratch_active = scratch_positions.unsqueeze(0) < scratch_flat_lengths.unsqueeze(1)
+    scratch_active
+    return (scratch_active,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    Finally, `scatter_add_` puts each active contribution at its coordinate in the `256P` vector. This preserved scratch cell uses `sqrt(length)`; the class and experiment codec use `1/sqrt(length)`.
+    """)
+    return
+
+
+@app.cell
+def _(
+    scratch_active,
+    scratch_batch_tokens,
+    scratch_char_dim,
+    scratch_d_p,
+    scratch_flat_lengths,
+    scratch_indexes,
+    torch,
+):
+    scratch_final = torch.zeros((scratch_batch_tokens, scratch_d_p * scratch_char_dim))
+    scratch_source = torch.sqrt(scratch_flat_lengths).unsqueeze(1) * scratch_active
+    scratch_final.scatter_add_(1, scratch_indexes.to(int), scratch_source)
     return
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## 4 · The rest is a normal GPT-style transformer
+    ### Reusing your handwritten class
 
-    For token representations $X\in\mathbb{R}^{B\times T\times d_{model}}$, each attention head forms
-
-    $$Q=XW_Q,\qquad K=XW_K,\qquad V=XW_V.$$
-
-    - $Q$ (**queries**) asks what each position is looking for.
-    - $K$ (**keys**) describes what each position offers.
-    - $V$ (**values**) carries the information that will be mixed.
-    - $W_Q,W_K,W_V$ are learned matrices.
-
-    Attention is
-
-    $$\operatorname{softmax}\left(\frac{QK^\top}{\sqrt{d_{head}}}+M\right)V.$$
-
-    $QK^\top$ scores every query-key pair. $\sqrt{d_{head}}$ stabilizes score scale. The causal mask $M$ sets future positions to $-\infty$, so after softmax they receive probability zero. This is why an autoregressive LLM cannot peek at future tokens.
-
-    The MLP transforms each position independently; residual connections preserve an easy information path around attention and the MLP.
+    Your `KroneckerV1Embedding` preserves the core byte-position calculation, but its `forward` has not yet been completed. The comparison's `byte_codec_cmp` uses the same idea while supporting both token tables and batches of chunks, handling zero-length end markers, and using population standard deviation. That keeps the recorded experiments numerically consistent. To reuse your class in a new run, align those details and pass its codec output through the model's linear input projection.
     """)
     return
 
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.image(
-        "assets/transformer-block.svg",
-        alt="A causal transformer block with attention, MLP, and residual paths",
-        width="100%",
-    )
+    mo.md(r"""
+    ### A tiny byte-index example
+
+    **Objective:** Check the broadcast rule before using it in a model. With at most `P` bytes per token, each `(byte value, position)` pair owns one coordinate in a `256 × P` grid. Its flat index is `byte * P + position`. The short cell below prints indices and the mask that ignores padding.
+    """)
     return
 
 
 @app.cell
-def _(
-    BYTE_VALUES,
-    F,
-    KroneckerEmbedding,
-    MAX_TOKEN_BYTES,
-    dataclass,
-    math,
-    nn,
-    torch,
-):
-    @dataclass(frozen=True)
-    class TinyConfig:
-        vocab_size: int
-        context_length: int = 48
-        d_model: int = 64
-        n_heads: int = 4
-        n_layers: int = 2
-        mlp_multiplier: int = 4
+def _(torch):
+    codec_demo_bytes = torch.tensor([[97, 98, 0], [99, 0, 0]], dtype=torch.uint8)
+    codec_demo_lengths = torch.tensor([2, 1])
+    codec_demo_positions = torch.arange(codec_demo_bytes.shape[-1])
+    codec_demo_indices = codec_demo_bytes.long() * 3 + codec_demo_positions
+    codec_demo_active = codec_demo_positions < codec_demo_lengths[:, None]
+    print("coordinate indices:", codec_demo_indices.tolist())
+    print("active positions:", codec_demo_active.tolist())
+    return
 
-    class CausalSelfAttention(nn.Module):
-        def __init__(self, config):
+
+@app.cell(hide_code=True)
+def _():
+    import marimo as mo_cmp
+    mo_cmp.md("""
+    ## Three model interfaces
+
+    **Objective:** Hold the causal Transformer body fixed and change how text enters and leaves it.
+
+    | Model | Input | Next-step prediction |
+    |---|---|---|
+    | Standard | Learned BPE token embedding | BPE vocabulary softmax, tied to the input table |
+    | Kronecker input | Fixed byte-position codec, then learned projection | BPE vocabulary softmax |
+    | Vocabulary-free byte model | Fixed codec of UTF-8 chunks, then learned projection | 256 choices at each byte position, plus a length/end choice |
+
+    The data cell first makes both BPE tokens and byte chunks from the same documents. The model cell then defines the shared attention body and the three input/output branches. The batch and loss cells shift inputs by one step and score predictions in **bits per raw byte**, so lower is better.
+
+    The byte model predicts all bytes of the next chunk **at once**. It has no vocabulary-sized matrices, but an early byte of that new chunk cannot help predict a later byte. The result tables record completed runs; running a training cell starts a new run.
+    """)
+    return (mo_cmp,)
+
+
+@app.cell
+def _():
+
+    def build_comparison_data(vocab_size=4096, chunk_bytes=12):
+        """Build matching BPE and byte-chunk streams from Tiny Shakespeare."""
+        import re
+        from urllib.request import urlopen
+        from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers
+
+        url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+        with urlopen(url, timeout=30) as response:
+            text = response.read(2_000_000).decode("utf-8")
+        # This corpus is overwhelmingly ASCII. Keeping ASCII guarantees that each
+        # BPE token decodes independently to exactly the bytes used by the codec.
+        text = text.encode("ascii", errors="ignore").decode("ascii")
+        documents = [part + "\n\n" for part in text.split("\n\n") if part]
+        split = int(len(documents) * 0.9)
+        train_docs, val_docs = documents[:split], documents[split:]
+
+        tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tokenizer.decoder = decoders.ByteLevel()
+        trainer = trainers.BpeTrainer(
+            vocab_size=vocab_size,
+            special_tokens=["<unk>", "<eos>"],
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        )
+        tokenizer.train_from_iterator(train_docs, trainer=trainer)
+        eos_id = tokenizer.token_to_id("<eos>")
+
+        def bpe_stream(docs):
+            ids = []
+            for doc in docs:
+                ids.extend(tokenizer.encode(doc, add_special_tokens=False).ids)
+                ids.append(eos_id)
+            return ids
+
+        def chunk_stream(docs):
+            chunks = []
+            for doc in docs:
+                # Whitespace stays attached to the following word; long segments
+                # are split into consecutive chunks with no bytes discarded.
+                for segment in re.findall(r"\s*\S+|\s+", doc):
+                    raw = segment.encode("ascii")
+                    chunks.extend(raw[i:i + chunk_bytes] for i in range(0, len(raw), chunk_bytes))
+                chunks.append(b"")  # length zero is the end-of-document signal
+            return chunks
+
+        token_bytes = [
+            b"<eos>" if i == eos_id else tokenizer.decode([i], skip_special_tokens=False).encode("ascii", errors="replace")
+            for i in range(tokenizer.get_vocab_size())
+        ]
+        train_bpe = bpe_stream(train_docs)
+        val_bpe = bpe_stream(val_docs)
+        used_ids = set(train_bpe + val_bpe)
+        assert all(
+            tokenizer.decode([i], skip_special_tokens=False).isascii()
+            for i in used_ids if i != eos_id
+        )
+        assert tokenizer.decode(train_bpe[:-1], skip_special_tokens=True) == "".join(train_docs)
+
+        return {
+            "url": url,
+            "train_docs": train_docs,
+            "val_docs": val_docs,
+            "tokenizer": tokenizer,
+            "eos_id": eos_id,
+            "token_bytes": token_bytes,
+            "train_bpe": train_bpe,
+            "val_bpe": val_bpe,
+            "train_chunks": chunk_stream(train_docs),
+            "val_chunks": chunk_stream(val_docs),
+            "chunk_bytes": chunk_bytes,
+            "vocab_size": tokenizer.get_vocab_size(),
+        }
+
+    cmp_data = build_comparison_data()
+    print(
+        "Tiny Shakespeare:",
+        len("".join(cmp_data["train_docs"]).encode("ascii")), "train bytes,",
+        len("".join(cmp_data["val_docs"]).encode("ascii")), "validation bytes;",
+        cmp_data["vocab_size"], "BPE tokens;"
+        , cmp_data["chunk_bytes"], "bytes per chunk"
+    )
+    return (cmp_data,)
+
+
+@app.cell(hide_code=True)
+def _(mo_cmp):
+    mo_cmp.md("""
+    ### One Transformer, three ways in and out
+
+    `byte_codec_cmp` marks one coordinate for each real `(byte, position)` pair, scales by `1/sqrt(length)`, then normalizes the vector. The Kronecker-input model precomputes codes for BPE tokens; the byte model makes codes from chunks on demand. `SmallLanguageModelCmp` uses the same attention blocks for all modes and selects the matching output head. Your handwritten draft remains above; this experiment codec handles zero-length end markers and uses population standard deviation.
+    """)
+    return
+
+
+@app.cell
+def _():
+    import math as math_cmp
+    import torch as torch_cmp
+    from torch import nn as nn_cmp
+    from torch.nn import functional as F_cmp
+
+
+    def byte_codec_cmp(byte_values, lengths):
+        """Map (..., P) byte values and (...) lengths to (..., 256*P) codes."""
+        # Byte b at position p occupies coordinate b*P + p.
+        p = byte_values.shape[-1]
+        positions = torch_cmp.arange(p, device=byte_values.device)
+        indices = byte_values.long() * p + positions
+        active = positions < lengths[..., None]
+        weights = active.float() * lengths.clamp_min(1).float().rsqrt()[..., None]
+
+        codec = torch_cmp.zeros(
+            *byte_values.shape[:-1], 256 * p, device=byte_values.device
+        )
+        codec.scatter_add_(-1, indices, weights)
+        # The paper applies per-token z-normalization after the fixed codec.
+        mean = codec.mean(dim=-1, keepdim=True)
+        std = codec.std(dim=-1, keepdim=True, correction=0)
+        return (codec - mean) / (std + 1e-6)
+
+
+    def build_codec_table_cmp(token_bytes, chunk_bytes):
+        """Precompute the fixed input code for every BPE token."""
+        rows = torch_cmp.zeros(len(token_bytes), chunk_bytes, dtype=torch_cmp.uint8)
+        lengths = torch_cmp.zeros(len(token_bytes), dtype=torch_cmp.long)
+        for token_id, raw in enumerate(token_bytes):
+            clipped = raw[:chunk_bytes]
+            rows[token_id, :len(clipped)] = torch_cmp.tensor(list(clipped), dtype=torch_cmp.uint8)
+            lengths[token_id] = len(clipped)
+        return byte_codec_cmp(rows, lengths)
+
+
+    class CausalBlockCmp(nn_cmp.Module):
+        def __init__(self, width, heads):
             super().__init__()
-            assert config.d_model % config.n_heads == 0
-            self.n_heads = config.n_heads
-            self.head_dim = config.d_model // config.n_heads
-            self.qkv = nn.Linear(
-                config.d_model, 3 * config.d_model, bias=False
+            self.heads = heads
+            self.norm1 = nn_cmp.LayerNorm(width)
+            self.qkv = nn_cmp.Linear(width, 3 * width)
+            self.attn_out = nn_cmp.Linear(width, width)
+            self.norm2 = nn_cmp.LayerNorm(width)
+            self.mlp = nn_cmp.Sequential(
+                nn_cmp.Linear(width, 4 * width),
+                nn_cmp.GELU(),
+                nn_cmp.Linear(4 * width, width),
             )
-            self.output = nn.Linear(config.d_model, config.d_model, bias=False)
 
         def forward(self, x):
-            batch, time_steps, width = x.shape
-            query, key, value = self.qkv(x).chunk(3, dim=-1)
-            query = query.view(
-                batch, time_steps, self.n_heads, self.head_dim
-            ).transpose(1, 2)
-            key = key.view(
-                batch, time_steps, self.n_heads, self.head_dim
-            ).transpose(1, 2)
-            value = value.view(
-                batch, time_steps, self.n_heads, self.head_dim
-            ).transpose(1, 2)
-            scores = query @ key.transpose(-2, -1) / math.sqrt(self.head_dim)
-            future_mask = torch.triu(
-                torch.ones(
-                    time_steps, time_steps, dtype=torch.bool, device=x.device
-                ),
-                diagonal=1,
-            )
-            weights = F.softmax(
-                scores.masked_fill(future_mask, float("-inf")), dim=-1
-            )
-            mixed = weights @ value
-            mixed = (
-                mixed.transpose(1, 2)
-                .contiguous()
-                .view(batch, time_steps, width)
-            )
-            return self.output(mixed)
+            batch, time, width = x.shape
+            q, k, v = self.qkv(self.norm1(x)).chunk(3, dim=-1)
+            shape = (batch, time, self.heads, width // self.heads)
+            q, k, v = (item.reshape(shape).transpose(1, 2) for item in (q, k, v))
+            attention = F_cmp.scaled_dot_product_attention(q, k, v, is_causal=True)
+            attention = attention.transpose(1, 2).reshape(batch, time, width)
+            x = x + self.attn_out(attention)
+            return x + self.mlp(self.norm2(x))
 
-    class FeedForward(nn.Module):
-        def __init__(self, config):
-            super().__init__()
-            hidden = config.mlp_multiplier * config.d_model
-            self.layers = nn.Sequential(
-                nn.Linear(config.d_model, hidden),
-                nn.GELU(),
-                nn.Linear(hidden, config.d_model),
-            )
 
-        def forward(self, x):
-            return self.layers(x)
+    class SmallLanguageModelCmp(nn_cmp.Module):
+        """One causal body with a selectable input representation and output head."""
 
-    class TransformerBlock(nn.Module):
-        def __init__(self, config):
-            super().__init__()
-            self.attention_norm = nn.LayerNorm(config.d_model)
-            self.attention = CausalSelfAttention(config)
-            self.mlp_norm = nn.LayerNorm(config.d_model)
-            self.mlp = FeedForward(config)
-
-        def forward(self, x):
-            x = x + self.attention(self.attention_norm(x))
-            return x + self.mlp(self.mlp_norm(x))
-
-    class TinyGPT(nn.Module):
         def __init__(
-            self, config, embedding_kind, byte_buffer=None, length_buffer=None
+            self, mode, vocab_size, codec_table=None,
+            width=128, layers=3, heads=4, context=64, chunk_bytes=12,
         ):
             super().__init__()
-            self.config = config
-            self.embedding_kind = embedding_kind
-            if embedding_kind == "standard":
-                self.token_embedding = nn.Embedding(
-                    config.vocab_size, config.d_model
-                )
-            elif embedding_kind == "kronecker":
-                self.token_embedding = KroneckerEmbedding(
-                    byte_buffer,
-                    length_buffer,
-                    d_model=config.d_model,
-                    char_dim=BYTE_VALUES,
-                    pos_dim=MAX_TOKEN_BYTES,
-                )
+            assert mode in {"standard", "kronecker", "byte"}
+            assert width % heads == 0
+            self.mode = mode
+            self.chunk_bytes = chunk_bytes
+            self.context = context
+
+            if mode == "standard":
+                self.input = nn_cmp.Embedding(vocab_size, width)
             else:
-                raise ValueError(
-                    "embedding_kind must be 'standard' or 'kronecker'"
+                self.input = nn_cmp.Linear(256 * chunk_bytes, width, bias=False)
+                if mode == "kronecker":
+                    self.register_buffer("codec_table", codec_table)
+
+            self.positions = nn_cmp.Embedding(context, width)
+            self.blocks = nn_cmp.ModuleList(
+                CausalBlockCmp(width, heads) for _ in range(layers)
+            )
+            self.final_norm = nn_cmp.LayerNorm(width)
+            if mode == "standard":
+                self.output = None  # reuse the input matrix for vocabulary logits
+            elif mode == "kronecker":
+                self.output = nn_cmp.Linear(width, vocab_size, bias=False)
+            else:
+                self.output = nn_cmp.Linear(width, 256 * chunk_bytes)
+                self.length_output = nn_cmp.Linear(width, chunk_bytes + 1)
+
+            self.apply(self._init_weights)
+            if mode != "standard":
+                # z-normalized codec has variance about one per coordinate.
+                nn_cmp.init.normal_(
+                    self.input.weight, std=0.02 / math_cmp.sqrt(256 * chunk_bytes)
                 )
 
-            self.position_embedding = nn.Embedding(
-                config.context_length, config.d_model
-            )
-            self.blocks = nn.ModuleList(
-                [TransformerBlock(config) for _ in range(config.n_layers)]
-            )
-            self.final_norm = nn.LayerNorm(config.d_model)
-            self.lm_head = nn.Linear(
-                config.d_model, config.vocab_size, bias=False
-            )
+        @staticmethod
+        def _init_weights(module):
+            if isinstance(module, (nn_cmp.Linear, nn_cmp.Embedding)):
+                nn_cmp.init.normal_(module.weight, std=0.02)
+                if isinstance(module, nn_cmp.Linear) and module.bias is not None:
+                    nn_cmp.init.zeros_(module.bias)
 
-        def forward(self, input_ids, return_token_vectors=False):
-            batch, time_steps = input_ids.shape
-            if time_steps > self.config.context_length:
-                raise ValueError("sequence exceeds configured context length")
-            positions = torch.arange(time_steps, device=input_ids.device)
-            token_vectors = self.token_embedding(input_ids)
-            x = token_vectors + self.position_embedding(positions)[None, :, :]
+        def forward(self, values, lengths=None):
+            if self.mode == "standard":
+                x = self.input(values)
+            elif self.mode == "kronecker":
+                x = self.input(F_cmp.embedding(values, self.codec_table))
+            else:
+                x = self.input(byte_codec_cmp(values, lengths))
+
+            time = x.shape[1]
+            x = x + self.positions(torch_cmp.arange(time, device=x.device))
             for block in self.blocks:
                 x = block(x)
-            hidden = self.final_norm(x)
-            logits = self.lm_head(hidden)
-            if return_token_vectors:
-                return logits, token_vectors
-            return logits
+            x = self.final_norm(x)
 
-    return TinyConfig, TinyGPT
+            if self.mode == "standard":
+                return F_cmp.linear(x, self.input.weight), None
+            if self.mode == "kronecker":
+                return self.output(x), None
 
+            byte_logits = self.output(x).reshape(
+                *x.shape[:-1], 256, self.chunk_bytes
+            )
+            length_logits = self.length_output(x)
+            return byte_logits, length_logits
 
-@app.cell
-def _(time, torch):
-    def count_trainable(module):
-        return sum(
-            parameter.numel()
-            for parameter in module.parameters()
-            if parameter.requires_grad
-        )
-
-    def copy_shared_weights(source, target):
-        target.position_embedding.load_state_dict(
-            source.position_embedding.state_dict()
-        )
-        target.blocks.load_state_dict(source.blocks.state_dict())
-        target.final_norm.load_state_dict(source.final_norm.state_dict())
-        target.lm_head.load_state_dict(source.lm_head.state_dict())
-
-    def benchmark_forward(model, ids, repeats=5):
-        model.eval()
-        with torch.no_grad():
-            for _ in range(2):
-                model(ids)
-            start = time.perf_counter()
-            for _ in range(repeats):
-                model(ids)
-            return 1_000 * (time.perf_counter() - start) / repeats
-
-    return benchmark_forward, copy_shared_weights, count_trainable
-
-
-@app.cell
-def _(
-    CONTEXT_LENGTH,
-    MODEL_SEED,
-    MODEL_WIDTH,
-    N_HEADS,
-    N_LAYERS,
-    TinyConfig,
-    TinyGPT,
-    VOCAB_SIZE,
-    copy_shared_weights,
-    gpt2_byte_buffer,
-    gpt2_length_buffer,
-    info_card,
-    torch,
-):
-    tiny_config = TinyConfig(
-        vocab_size=VOCAB_SIZE,
-        context_length=CONTEXT_LENGTH,
-        d_model=MODEL_WIDTH,
-        n_heads=N_HEADS,
-        n_layers=N_LAYERS,
+    return (
+        F_cmp,
+        SmallLanguageModelCmp,
+        build_codec_table_cmp,
+        math_cmp,
+        torch_cmp,
     )
-
-    torch.manual_seed(MODEL_SEED)
-    standard_model = TinyGPT(tiny_config, embedding_kind="standard")
-    torch.manual_seed(MODEL_SEED)
-    kronecker_model = TinyGPT(
-        tiny_config,
-        embedding_kind="kronecker",
-        byte_buffer=gpt2_byte_buffer,
-        length_buffer=gpt2_length_buffer,
-    )
-    copy_shared_weights(standard_model, kronecker_model)
-
-    info_card(
-        "Two comparable models are ready",
-        "The transformer body, positional embedding, final normalization, and untied output head have identical weights. "
-        "Only the input embedding modules differ.",
-        "#4ade80",
-    )
-    return kronecker_model, standard_model
-
-
-@app.cell
-def _(
-    encoding,
-    html_table,
-    info_card,
-    input_ids_tensor,
-    kronecker_model,
-    mo,
-    standard_model,
-    torch,
-):
-    standard_model.eval()
-    kronecker_model.eval()
-    with torch.no_grad():
-        standard_logits, standard_token_vectors = standard_model(
-            input_ids_tensor, return_token_vectors=True
-        )
-        kronecker_logits, kronecker_token_vectors = kronecker_model(
-            input_ids_tensor, return_token_vectors=True
-        )
-
-    standard_next_token_id = int(standard_logits[0, -1].argmax())
-    kronecker_next_token_id = int(kronecker_logits[0, -1].argmax())
-    standard_next_piece = repr(encoding.decode([standard_next_token_id]))
-    kronecker_next_piece = repr(encoding.decode([kronecker_next_token_id]))
-
-    model_run_rows = [
-        (
-            "standard",
-            tuple(standard_token_vectors.shape),
-            tuple(standard_logits.shape),
-            standard_next_piece,
-        ),
-        (
-            "Kronecker",
-            tuple(kronecker_token_vectors.shape),
-            tuple(kronecker_logits.shape),
-            kronecker_next_piece,
-        ),
-    ]
-
-    mo.vstack(
-        [
-            html_table(
-                [
-                    "model",
-                    "embedding output",
-                    "logits output",
-                    "random top-1 next piece",
-                ],
-                model_run_rows,
-            ),
-            info_card(
-                "Do not interpret these predictions",
-                "Both networks are untrained. The top-1 pieces merely prove that each complete LLM path executes from token IDs to vocabulary logits.",
-                "#f59e0b",
-            ),
-        ]
-    )
-    return
-
-
-@app.cell
-def _(
-    CODEC_DIM,
-    MODEL_WIDTH,
-    VOCAB_SIZE,
-    benchmark_forward,
-    count_trainable,
-    html_table,
-    input_ids_tensor,
-    kronecker_model,
-    standard_model,
-):
-    normal_input_parameters = VOCAB_SIZE * MODEL_WIDTH
-    kronecker_input_parameters = CODEC_DIM * MODEL_WIDTH
-    input_parameter_reduction = 100 * (
-        1 - kronecker_input_parameters / normal_input_parameters
-    )
-    standard_total_parameters = count_trainable(standard_model)
-    kronecker_total_parameters = count_trainable(kronecker_model)
-    standard_ms = benchmark_forward(standard_model, input_ids_tensor)
-    kronecker_ms = benchmark_forward(kronecker_model, input_ids_tensor)
-
-    parameter_rows = [
-        (
-            "normal input",
-            f"V × d_model = {VOCAB_SIZE:,} × {MODEL_WIDTH}",
-            f"{normal_input_parameters:,}",
-        ),
-        (
-            "Kronecker input",
-            f"D × d_model = {CODEC_DIM:,} × {MODEL_WIDTH}",
-            f"{kronecker_input_parameters:,}",
-        ),
-        ("input reduction", "1 − D/V", f"{input_parameter_reduction:.1f}%"),
-        (
-            "normal total",
-            "all trainable tensors",
-            f"{standard_total_parameters:,}",
-        ),
-        (
-            "Kronecker total",
-            "all trainable tensors",
-            f"{kronecker_total_parameters:,}",
-        ),
-    ]
-
-    html_table(["quantity", "formula", "observed"], parameter_rows)
-    return kronecker_ms, standard_ms
 
 
 @app.cell(hide_code=True)
-def _(mo):
-    mo.image(
-        "assets/parameter-comparison.svg",
-        alt="Normal versus Kronecker trainable input parameter counts",
-        width="100%",
-    )
-    return
+def _(mo_cmp):
+    mo_cmp.md("""
+    ### Batches, training, and a common score
 
+    **Objective:** Make the comparisons use the same training and validation rules. A window of positions `0..T-1` predicts positions `1..T`. For BPE, the loss scores the next token; for bytes, it scores active bytes of the next chunk plus its length (zero means end of document). Both losses are divided by the number of **raw target bytes** and reported as bits/byte.
 
-@app.cell(hide_code=True)
-def _(mo):
-    mo.image(
-        "assets/codec-similarity.svg",
-        alt="Cosine similarities induced by shared bytes at shared positions",
-        width="100%",
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## 5 · What changed, and what did not?
-
-    | Component | Normal model | Kronecker model |
-    |---|---|---|
-    | Tokenizer | GPT-2 BPE | **same GPT-2 BPE** |
-    | Input representation | learned row per token ID | fixed byte-position features + learned projection |
-    | Output shape | $B\times T\times d_{model}$ | **same shape** |
-    | Positional embedding | learned | **same** |
-    | Attention and MLP | normal causal transformer | **same** |
-    | Output head | untied $d_{model}\to V$ | **same and untied** |
-    | Input trainable parameters | $Vd_{model}$ | $Dd_{model}$ |
-    | Built-in geometry | none before training | byte equality at equal positions |
-
-    ### The conceptual trade
-
-    The normal table gives every token an independent trainable memory slot. It is expressive, but large vocabularies require many parameters and rare rows receive few updates.
-
-    Kronecker replaces those independent slots with a shared rule. Every token is described through the same byte-position coordinate system, so related surface forms share features immediately. The cost is a rigid prior: byte-similar but semantically unrelated strings also start close, and shifted suffixes can look less similar than expected.
-
-    ### Why both output heads are untied here
-
-    Many GPT implementations reuse the input table as the output classifier. Kronecker cannot do that directly because its fixed codec width $D$ generally differs from $d_{model}$. We deliberately use a separate output head in **both** notebook models, ensuring the experiment changes only the input representation.
+    Random windows provide training batches. Nonoverlapping held-out windows provide validation batches. A shared `train_until_cmp` helper performs optimizer steps for the pilot and both larger experiments; each experiment chooses its own model size and byte budget.
     """)
     return
 
 
 @app.cell
-def _(html_table, kronecker_ms, mo, standard_ms):
-    runtime_rows = [
-        (
-            "standard forward",
-            f"{standard_ms:.3f} ms",
-            "row lookup + same transformer",
-        ),
-        (
-            "Kronecker forward",
-            f"{kronecker_ms:.3f} ms",
-            "construct codec + projection + same transformer",
-        ),
-    ]
-    mo.vstack(
-        [
-            html_table(
-                ["untrained CPU measurement", "mean", "work performed"],
-                runtime_rows,
-            ),
-            mo.md(
-                "Runtime here is a tiny CPU demonstration, not a production benchmark. The dynamic codec trades extra arithmetic for much lower fixed-buffer memory."
-            ),
-        ]
+def _(
+    F_cmp,
+    SmallLanguageModelCmp,
+    build_codec_table_cmp,
+    cmp_data,
+    math_cmp,
+    torch_cmp,
+):
+
+    import time as time_cmp
+
+
+    def prepare_streams_cmp(data, device):
+        """Move BPE IDs, byte chunks, lengths, and the fixed codec table to device."""
+        p = data["chunk_bytes"]
+        token_bytes = data["token_bytes"]
+
+        # Input codec may truncate very rare BPE tokens; target byte counts do not.
+        codec_table = build_codec_table_cmp(token_bytes, p).to(device)
+        target_byte_lengths = torch_cmp.tensor(
+            [0 if i == data["eos_id"] else len(raw)
+             for i, raw in enumerate(token_bytes)],
+            device=device, dtype=torch_cmp.long,
+        )
+
+        def pack_chunks(chunks):
+            raw = b"".join(chunk.ljust(p, b"\0") for chunk in chunks)
+            values = torch_cmp.frombuffer(bytearray(raw), dtype=torch_cmp.uint8)
+            values = values.reshape(-1, p).to(device)
+            lengths = torch_cmp.tensor(
+                [len(chunk) for chunk in chunks], device=device, dtype=torch_cmp.long
+            )
+            return values, lengths
+
+        return {
+            "codec_table": codec_table,
+            "bpe_byte_lengths": target_byte_lengths,
+            "train_bpe": torch_cmp.tensor(data["train_bpe"], device=device),
+            "val_bpe": torch_cmp.tensor(data["val_bpe"], device=device),
+            "train_byte": pack_chunks(data["train_chunks"]),
+            "val_byte": pack_chunks(data["val_chunks"]),
+        }
+
+
+    def batch_cmp(streams, mode, split, starts, context):
+        positions = starts[:, None] + torch_cmp.arange(
+            context + 1, device=starts.device
+        )
+        if mode == "byte":
+            values, lengths = streams[split + "_byte"]
+            sampled = values[positions]
+            sampled_lengths = lengths[positions]
+            return sampled[:, :-1], sampled_lengths[:, :-1], sampled[:, 1:], sampled_lengths[:, 1:]
+
+        sampled = streams[split + "_bpe"][positions]
+        return sampled[:, :-1], None, sampled[:, 1:], None
+
+
+    def loss_cmp(model, batch, streams):
+        """Return summed predictive loss divided by target raw-byte count."""
+        inputs, input_lengths, targets, target_lengths = batch
+        logits, length_logits = model(inputs, input_lengths)
+
+        if model.mode != "byte":
+            nll = F_cmp.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                targets.reshape(-1),
+                reduction="sum",
+            )
+            byte_count = streams["bpe_byte_lengths"][targets].sum()
+            return nll / byte_count, byte_count
+
+        p = model.chunk_bytes
+        byte_nll = F_cmp.cross_entropy(
+            logits.permute(0, 2, 1, 3), targets.long(), reduction="none"
+        )
+        active = torch_cmp.arange(p, device=targets.device) < target_lengths[..., None]
+        length_nll = F_cmp.cross_entropy(
+            length_logits.reshape(-1, p + 1),
+            target_lengths.reshape(-1),
+            reduction="sum",
+        )
+        byte_count = target_lengths.sum()
+        nll = (byte_nll * active).sum() + length_nll
+        return nll / byte_count, byte_count
+
+
+    @torch_cmp.no_grad()
+    def evaluate_cmp(model, streams, context=64, batch_size=32):
+        """Evaluate nonoverlapping windows of the held-out stream."""
+        model.eval()
+        device = next(model.parameters()).device
+        values = streams["val_byte"][0] if model.mode == "byte" else streams["val_bpe"]
+        starts = torch_cmp.arange(
+            0, len(values) - context - 1, context, device=device
+        )
+        total_nll = 0.0
+        total_bytes = 0
+        for group in starts.split(batch_size):
+            batch = batch_cmp(streams, model.mode, "val", group, context)
+            with torch_cmp.autocast("cuda", dtype=torch_cmp.bfloat16):
+                nll_per_byte, byte_count = loss_cmp(model, batch, streams)
+            count = int(byte_count)
+            total_nll += float(nll_per_byte) * count
+            total_bytes += count
+        model.train()
+        return total_nll / total_bytes, total_bytes
+
+
+    def train_until_cmp(
+        model, optimizer, streams, *, context, batch_size,
+        target_bytes, bytes_seen=0, steps=0, capture_first_loss=False,
+    ):
+        """Take optimizer steps until the requested raw-byte exposure is reached."""
+        mode = model.mode
+        device = streams["codec_table"].device
+        values = streams["train_byte"][0] if mode == "byte" else streams["train_bpe"]
+        first_loss = None
+
+        while bytes_seen < target_bytes:
+            starts = torch_cmp.randint(
+                0, len(values) - context - 1, (batch_size,), device=device
+            )
+            batch = batch_cmp(streams, mode, "train", starts, context)
+            optimizer.zero_grad(set_to_none=True)
+            with torch_cmp.autocast("cuda", dtype=torch_cmp.bfloat16):
+                loss, batch_bytes = loss_cmp(model, batch, streams)
+            loss.backward()
+            torch_cmp.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            if capture_first_loss and first_loss is None:
+                first_loss = float(loss.detach())
+            bytes_seen += int(batch_bytes)
+            steps += 1
+
+        return bytes_seen, steps, first_loss
+
+
+    def train_one_cmp(
+        mode, streams, vocab_size, chunk_bytes,
+        byte_budget=2_000_000, context=64, batch_size=32, seed=7,
+    ):
+        torch_cmp.manual_seed(seed)
+        torch_cmp.cuda.manual_seed_all(seed)
+        device = streams["codec_table"].device
+        model = SmallLanguageModelCmp(
+            mode=mode, vocab_size=vocab_size,
+            codec_table=streams["codec_table"] if mode == "kronecker" else None,
+            chunk_bytes=chunk_bytes, context=context,
+        ).to(device)
+        optimizer = torch_cmp.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
+        parameter_count = sum(p.numel() for p in model.parameters())
+
+        torch_cmp.cuda.synchronize()
+        start_time = time_cmp.perf_counter()
+        bytes_seen = 0
+        steps = 0
+        bytes_seen, steps, first_loss = train_until_cmp(
+            model, optimizer, streams, context=context, batch_size=batch_size,
+            target_bytes=byte_budget, capture_first_loss=True,
+        )
+        torch_cmp.cuda.synchronize()
+        seconds = time_cmp.perf_counter() - start_time
+
+        val_nats, val_bytes = evaluate_cmp(model, streams, context, batch_size)
+        return {
+            "mode": mode,
+            "parameters": parameter_count,
+            "steps": steps,
+            "train_bytes": bytes_seen,
+            "train_seconds": seconds,
+            "train_bytes_per_second": bytes_seen / seconds,
+            "first_train_bpb": first_loss / math_cmp.log(2),
+            "val_bpb": val_nats / math_cmp.log(2),
+            "val_bytes": val_bytes,
+            "model": model,
+        }
+
+
+    cmp_streams = prepare_streams_cmp(cmp_data, "cuda")
+    print("Prepared GPU data:", cmp_streams["train_bpe"].shape,
+          cmp_streams["train_byte"][0].shape,
+          cmp_streams["codec_table"].shape)
+    return (
+        cmp_streams,
+        evaluate_cmp,
+        prepare_streams_cmp,
+        time_cmp,
+        train_one_cmp,
+        train_until_cmp,
     )
+
+
+@app.cell(hide_code=True)
+def _(mo_cmp):
+    mo_cmp.md("""
+    ## Tiny Shakespeare pilot
+
+    **Objective:** Quickly check that all three models can learn before using a larger corpus. Build short BPE and byte-chunk streams from Tiny Shakespeare, train three seeds to the same 10 MB raw-byte exposure, then inspect losses and a few generated samples. This is a sanity check, not a reproduction of the paper.
+    """)
+    return
+
+
+@app.cell
+def _(cmp_data, cmp_streams, train_one_cmp):
+
+    import statistics as stats_cmp
+
+    # A longer, three-seed pilot. The budget is raw bytes seen, not token count.
+    cmp_repeats = []
+    cmp_models = {}
+    for _seed in (7, 17, 29):
+        for _mode in ("standard", "kronecker", "byte"):
+            _result = train_one_cmp(
+                _mode, cmp_streams,
+                vocab_size=cmp_data["vocab_size"],
+                chunk_bytes=cmp_data["chunk_bytes"],
+                byte_budget=10_000_000,
+                context=64,
+                batch_size=32,
+                seed=_seed,
+            )
+            cmp_models[_mode, _seed] = _result.pop("model")
+            _result["seed"] = _seed
+            cmp_repeats.append(_result)
+            print(
+                f'seed={_seed:2d}  {_mode:10s}'
+                f'  val={_result["val_bpb"]:.3f} bits/byte'
+                f'  train={_result["train_seconds"]:.1f}s'
+            )
+
+    print("\nMean validation bits/byte (lower is better):")
+    for _mode in ("standard", "kronecker", "byte"):
+        _values = [r["val_bpb"] for r in cmp_repeats if r["mode"] == _mode]
+        print(
+            f'{_mode:10s}  {stats_cmp.mean(_values):.3f} ± '
+            f'{stats_cmp.stdev(_values):.3f}  (3 seeds)'
+        )
+    return (cmp_models,)
+
+
+@app.cell(hide_code=True)
+def _(mo_cmp):
+    mo_cmp.md("""
+    ### Read a few generated samples
+
+    Loss is the quantitative check. Sampling gives a quick, intuitive check for repetition, spelling, and whether the model stops. Both BPE modes choose a next token; the byte mode chooses a length and all bytes of the next chunk.
+    """)
+    return
+
+
+@app.cell
+def _(cmp_data, cmp_models, torch_cmp):
+
+    def generate_cmp(model, prompt, data, max_steps=60):
+        import re
+
+        model.eval()
+        device = next(model.parameters()).device
+        p = data["chunk_bytes"]
+
+        if model.mode != "byte":
+            ids = data["tokenizer"].encode(prompt, add_special_tokens=False).ids
+            for _ in range(max_steps):
+                x = torch_cmp.tensor([ids[-model.context:]], device=device)
+                with torch_cmp.inference_mode():
+                    logits, _ = model(x)
+                next_id = int(logits[0, -1].argmax())
+                if next_id == data["eos_id"]:
+                    break
+                ids.append(next_id)
+            return data["tokenizer"].decode(ids, skip_special_tokens=True)
+
+        chunks = []
+        for segment in re.findall(r"\s*\S+|\s+", prompt):
+            raw = segment.encode("utf-8")
+            chunks.extend(raw[i:i + p] for i in range(0, len(raw), p))
+
+        for _ in range(max_steps):
+            recent = chunks[-model.context:]
+            x = torch_cmp.zeros(1, len(recent), p, device=device, dtype=torch_cmp.uint8)
+            lengths = torch_cmp.tensor(
+                [[len(chunk) for chunk in recent]], device=device
+            )
+            for j, chunk in enumerate(recent):
+                x[0, j, :len(chunk)] = torch_cmp.tensor(
+                    list(chunk), device=device, dtype=torch_cmp.uint8
+                )
+            with torch_cmp.inference_mode():
+                byte_logits, length_logits = model(x, lengths)
+            next_length = int(length_logits[0, -1].argmax())
+            if next_length == 0:
+                break
+            next_bytes = byte_logits[0, -1].argmax(dim=0)[:next_length]
+            chunks.append(bytes(next_bytes.tolist()))
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+    cmp_prompt = "First Citizen:\n"
+    cmp_samples = {
+        mode: generate_cmp(cmp_models[mode, 7], cmp_prompt, cmp_data)
+        for mode in ("standard", "kronecker", "byte")
+    }
+    for _mode, _sample in cmp_samples.items():
+        print(_mode, repr(_sample[:350]))
+    return (generate_cmp,)
+
+
+@app.cell(hide_code=True)
+def _(mo_cmp):
+    mo_cmp.md("""
+    ### Tiny Shakespeare: recorded pilot
+
+    Three seeds, 10 MB sampled training bytes per run, a 3-layer width-128 body,
+    4,096 BPE tokens, and 12-byte chunks for the vocabulary-free model.
+    The values below come from the completed run; reading them does not retrain it.
+
+    | Model | Parameters | Mean validation bits/byte ↓ |
+    |---|---:|---:|
+    | Standard BPE | 1.13M | 2.244 |
+    | Kronecker input + BPE head | 1.52M | 2.238 |
+    | Parallel byte head | 1.39M | 3.878 |
+
+    The first two are close at this scale. The byte model is much worse, but it
+    also changes how text is segmented. This pilot only motivated the larger,
+    more varied FineWeb-Edu experiment below.
+    """)
     return
 
 
 @app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## 6 · Final mental model
+def _(mo_cmp):
+    mo_cmp.md("""
+    ## FineWeb-Edu comparison
 
-    ```text
-    Normal embedding
-    token ID i ──select row──> E[i] ──> transformer
-                               ↑
-                      V independent learned rows
+    **Objective:** Compare the same three designs on more varied text. We take disjoint training and validation documents from SmolLM FineWeb-Edu, train an 8,192-token BPE tokenizer on training documents only, and also make UTF-8 chunks from those documents. The next cells prepare both views on the GPU, train the three modes at matched raw-byte exposure across three seeds, and sample their outputs. The recorded table follows the code.
+    """)
+    return
 
-    Kronecker embedding
-    token ID i ──> token bytes ──> fixed κ(bytes) ──> learned W_proj ──> transformer
-                                      shared rule         shared map
-    ```
 
-    The paper's change happens **before contextual reasoning begins**. It does not alter attention, generation, the causal objective, or tokenization. It changes the prior representation handed to the first transformer block:
+@app.cell
+def _():
 
-    - normal embedding says: “this is vocabulary item 17,”
-    - Kronecker embedding says: “this token contains these bytes at these positions.”
+    def build_large_data_cmp(train_limit=20_000_000, val_limit=2_000_000,
+                             vocab_size=8192, chunk_bytes=16):
+        """Stream disjoint documents, then build BPE and byte-chunk views."""
+        import re
+        from datasets import load_dataset
+        from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers
 
-    To compare learning rather than mere execution, the next step would be to train both models on identical batches and plot held-out cross-entropy. This notebook intentionally stops at the clean architectural and mathematical comparison.
+        # Hash IDs so training and validation use disjoint documents, even
+        # though the source dataset only exposes a training split.
+        import hashlib
+        train_docs, val_docs = [], []
+        train_bytes = val_bytes = 0
+        rows = load_dataset(
+            "HuggingFaceTB/smollm-corpus",
+            "fineweb-edu-dedup",
+            split="train",
+            streaming=True,
+        )
+        for row in rows:
+            document = row["text"].strip() + "\n\n"
+            size = len(document.encode("utf-8"))
+            bucket = int.from_bytes(
+                hashlib.blake2b(row["id"].encode(), digest_size=8).digest(), "big"
+            ) % 10
+            if bucket == 0 and val_bytes + size <= val_limit:
+                val_docs.append(document)
+                val_bytes += size
+            elif bucket != 0 and train_bytes + size <= train_limit:
+                train_docs.append(document)
+                train_bytes += size
+            if train_bytes >= train_limit - 20_000 and val_bytes >= val_limit - 20_000:
+                break
 
-    **References:** [Kronecker Embeddings paper](https://arxiv.org/html/2605.29459v1) · [reference implementation](https://github.com/theschoolofai/kronecker-embeddings) · [marimo documentation](https://docs.marimo.io/)
+        tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tokenizer.decoder = decoders.ByteLevel()
+        trainer = trainers.BpeTrainer(
+            vocab_size=vocab_size,
+            special_tokens=["<unk>", "<eos>"],
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        )
+        tokenizer.train_from_iterator(train_docs, trainer=trainer)
+        eos_id = tokenizer.token_to_id("<eos>")
+
+        # Invert ByteLevel's reversible byte-to-character alphabet. This handles
+        # BPE pieces that contain only part of a UTF-8 character.
+        printable = (list(range(ord("!"), ord("~") + 1))
+                     + list(range(ord("¡"), ord("¬") + 1))
+                     + list(range(ord("®"), ord("ÿ") + 1)))
+        byte_values = printable.copy()
+        unicode_values = printable.copy()
+        for byte in range(256):
+            if byte not in printable:
+                byte_values.append(byte)
+                unicode_values.append(256 + len(unicode_values) - len(printable))
+        inverse_alphabet = {
+            chr(codepoint): byte for byte, codepoint in zip(byte_values, unicode_values)
+        }
+
+        token_bytes = []
+        for token_id in range(tokenizer.get_vocab_size()):
+            if token_id in (tokenizer.token_to_id("<unk>"), eos_id):
+                raw = tokenizer.id_to_token(token_id).encode("utf-8")
+            else:
+                raw = bytes(inverse_alphabet[character]
+                            for character in tokenizer.id_to_token(token_id))
+            token_bytes.append(raw)
+
+        def bpe_stream(documents):
+            result = []
+            for document in documents:
+                result.extend(tokenizer.encode(document, add_special_tokens=False).ids)
+                result.append(eos_id)
+            return result
+
+        def byte_stream(documents):
+            result = []
+            for document in documents:
+                for segment in re.findall(r"\s*\S+|\s+", document):
+                    raw = segment.encode("utf-8")
+                    result.extend(raw[i:i + chunk_bytes]
+                                  for i in range(0, len(raw), chunk_bytes))
+                result.append(b"")  # zero length means end of document
+            return result
+
+        train_bpe = bpe_stream(train_docs)
+        val_bpe = bpe_stream(val_docs)
+        train_chunks = byte_stream(train_docs)
+        val_chunks = byte_stream(val_docs)
+        assert b"".join(train_chunks) == "".join(train_docs).encode("utf-8")
+        assert b"".join(val_chunks) == "".join(val_docs).encode("utf-8")
+
+        return {
+            "source": "HuggingFaceTB/smollm-corpus/fineweb-edu-dedup",
+            "train_docs": train_docs,
+            "val_docs": val_docs,
+            "tokenizer": tokenizer,
+            "eos_id": eos_id,
+            "token_bytes": token_bytes,
+            "train_bpe": train_bpe,
+            "val_bpe": val_bpe,
+            "train_chunks": train_chunks,
+            "val_chunks": val_chunks,
+            "chunk_bytes": chunk_bytes,
+            "vocab_size": tokenizer.get_vocab_size(),
+        }
+
+
+    large_data_cmp = build_large_data_cmp()
+    print(
+        f"FineWeb-Edu: {len(large_data_cmp['train_docs'])} train documents, "
+        f"{len(large_data_cmp['val_docs'])} validation documents, "
+        f"{large_data_cmp['vocab_size']} BPE tokens, "
+        f"{len(large_data_cmp['train_chunks'])} training byte chunks"
+    )
+    return build_large_data_cmp, large_data_cmp
+
+
+@app.cell
+def _(large_data_cmp, prepare_streams_cmp):
+
+    large_streams_cmp = prepare_streams_cmp(large_data_cmp, "cuda")
+    print(
+        "GPU streams:",
+        tuple(large_streams_cmp["train_bpe"].shape),
+        tuple(large_streams_cmp["train_byte"][0].shape),
+        tuple(large_streams_cmp["codec_table"].shape),
+    )
+    return (large_streams_cmp,)
+
+
+@app.cell(hide_code=True)
+def _(mo_cmp):
+    mo_cmp.md("""
+    ### Train at a matched byte budget
+
+    The training function below evaluates at 10, 30, and 60 MB of sampled raw-byte exposure. The next two cells run seed 7, then seeds 17 and 29 with the same model settings; a final cell prints example completions.
+    """)
+    return
+
+
+@app.cell
+def _(
+    SmallLanguageModelCmp,
+    evaluate_cmp,
+    math_cmp,
+    time_cmp,
+    torch_cmp,
+    train_until_cmp,
+):
+
+    def train_scaled_cmp(mode, streams, data, seed=7,
+                         checkpoints=(10_000_000, 30_000_000, 60_000_000)):
+        """Train one larger model; record validation loss as raw bytes accumulate."""
+        torch_cmp.manual_seed(seed)
+        torch_cmp.cuda.manual_seed_all(seed)
+        device = streams["codec_table"].device
+        context, batch_size = 128, 16
+        model = SmallLanguageModelCmp(
+            mode=mode,
+            vocab_size=data["vocab_size"],
+            codec_table=streams["codec_table"] if mode == "kronecker" else None,
+            width=384, layers=8, heads=6, context=context,
+            chunk_bytes=data["chunk_bytes"],
+        ).to(device)
+        optimizer = torch_cmp.optim.AdamW(
+            model.parameters(), lr=3e-4, weight_decay=0.1
+        )
+        parameters = sum(parameter.numel() for parameter in model.parameters())
+
+        bytes_seen, steps, evaluation_seconds = 0, 0, 0.0
+        trace = []
+        torch_cmp.cuda.synchronize()
+        start_time = time_cmp.perf_counter()
+
+        for target_bytes in checkpoints:
+            bytes_seen, steps, _ = train_until_cmp(
+                model, optimizer, streams, context=context, batch_size=batch_size,
+                target_bytes=target_bytes, bytes_seen=bytes_seen, steps=steps,
+            )
+
+            torch_cmp.cuda.synchronize()
+            eval_start = time_cmp.perf_counter()
+            val_nats, val_bytes = evaluate_cmp(
+                model, streams, context=context, batch_size=batch_size
+            )
+            evaluation_seconds += time_cmp.perf_counter() - eval_start
+            train_seconds = time_cmp.perf_counter() - start_time - evaluation_seconds
+            point = {
+                "bytes_seen": bytes_seen,
+                "steps": steps,
+                "val_bpb": val_nats / math_cmp.log(2),
+                "val_bytes": val_bytes,
+                "train_seconds": train_seconds,
+            }
+            trace.append(point)
+            print(
+                f'{mode:10s}  seen={bytes_seen / 1e6:.1f} MB'
+                f'  steps={steps:5d}'
+                f'  val={point["val_bpb"]:.3f} bits/byte'
+                f'  train={train_seconds:.1f}s',
+                flush=True,
+            )
+
+        return {
+            "mode": mode,
+            "seed": seed,
+            "parameters": parameters,
+            "trace": trace,
+            "model": model,
+        }
+
+
+    return (train_scaled_cmp,)
+
+
+@app.cell
+def _(large_data_cmp, large_streams_cmp, train_scaled_cmp):
+    large_standard_seed7_cmp = train_scaled_cmp(
+        "standard", large_streams_cmp, large_data_cmp,
+        seed=7, checkpoints=(10_000_000, 30_000_000, 60_000_000),
+    )
+    return (large_standard_seed7_cmp,)
+
+
+@app.cell
+def _(large_data_cmp, large_streams_cmp, train_scaled_cmp):
+    large_kronecker_seed7_cmp = train_scaled_cmp(
+        "kronecker", large_streams_cmp, large_data_cmp,
+        seed=7, checkpoints=(10_000_000, 30_000_000, 60_000_000),
+    )
+    return (large_kronecker_seed7_cmp,)
+
+
+@app.cell
+def _(large_data_cmp, large_streams_cmp, train_scaled_cmp):
+    large_byte_seed7_cmp = train_scaled_cmp(
+        "byte", large_streams_cmp, large_data_cmp,
+        seed=7, checkpoints=(10_000_000, 30_000_000, 60_000_000),
+    )
+    return (large_byte_seed7_cmp,)
+
+
+@app.cell
+def _(
+    large_byte_seed7_cmp,
+    large_kronecker_seed7_cmp,
+    large_standard_seed7_cmp,
+):
+    large_results_cmp = {
+        "standard": large_standard_seed7_cmp,
+        "kronecker": large_kronecker_seed7_cmp,
+        "byte": large_byte_seed7_cmp,
+    }
+    print("Seed 7: all three model runs available for sampling.")
+    return (large_results_cmp,)
+
+
+@app.cell
+def _(large_data_cmp, large_streams_cmp, train_scaled_cmp):
+    large_standard_seed17_cmp = train_scaled_cmp(
+        "standard", large_streams_cmp, large_data_cmp,
+        seed=17, checkpoints=(60_000_000,),
+    )
+    return (large_standard_seed17_cmp,)
+
+
+@app.cell
+def _(large_data_cmp, large_streams_cmp, train_scaled_cmp):
+    large_kronecker_seed17_cmp = train_scaled_cmp(
+        "kronecker", large_streams_cmp, large_data_cmp,
+        seed=17, checkpoints=(60_000_000,),
+    )
+    return (large_kronecker_seed17_cmp,)
+
+
+@app.cell
+def _(large_data_cmp, large_streams_cmp, train_scaled_cmp):
+    large_byte_seed17_cmp = train_scaled_cmp(
+        "byte", large_streams_cmp, large_data_cmp,
+        seed=17, checkpoints=(60_000_000,),
+    )
+    return (large_byte_seed17_cmp,)
+
+
+@app.cell
+def _(large_data_cmp, large_streams_cmp, train_scaled_cmp):
+    large_standard_seed29_cmp = train_scaled_cmp(
+        "standard", large_streams_cmp, large_data_cmp,
+        seed=29, checkpoints=(60_000_000,),
+    )
+    return (large_standard_seed29_cmp,)
+
+
+@app.cell
+def _(large_data_cmp, large_streams_cmp, train_scaled_cmp):
+    large_kronecker_seed29_cmp = train_scaled_cmp(
+        "kronecker", large_streams_cmp, large_data_cmp,
+        seed=29, checkpoints=(60_000_000,),
+    )
+    return (large_kronecker_seed29_cmp,)
+
+
+@app.cell
+def _(large_data_cmp, large_streams_cmp, train_scaled_cmp):
+    large_byte_seed29_cmp = train_scaled_cmp(
+        "byte", large_streams_cmp, large_data_cmp,
+        seed=29, checkpoints=(60_000_000,),
+    )
+    return (large_byte_seed29_cmp,)
+
+
+@app.cell
+def _(
+    large_byte_seed17_cmp,
+    large_byte_seed29_cmp,
+    large_kronecker_seed17_cmp,
+    large_kronecker_seed29_cmp,
+    large_results_cmp,
+    large_standard_seed17_cmp,
+    large_standard_seed29_cmp,
+):
+    large_repeat_cmp = [
+        large_standard_seed17_cmp, large_kronecker_seed17_cmp, large_byte_seed17_cmp,
+        large_standard_seed29_cmp, large_kronecker_seed29_cmp, large_byte_seed29_cmp,
+    ]
+    for _mode in ("standard", "kronecker", "byte"):
+        _runs = [large_results_cmp[_mode]] + [
+            _run for _run in large_repeat_cmp if _run["mode"] == _mode
+        ]
+        _values = [_run["trace"][-1]["val_bpb"] for _run in _runs]
+        print(f"{_mode:10s} mean={sum(_values) / len(_values):.4f} bits/byte; "
+              f"seeds 7/17/29={[round(_value, 4) for _value in _values]}")
+    return
+
+
+@app.cell
+def _(generate_cmp, large_data_cmp, large_results_cmp):
+
+    large_samples_cmp = {
+        _mode: generate_cmp(
+            large_results_cmp[_mode]["model"],
+            "The history of science",
+            large_data_cmp,
+            max_steps=40,
+        )
+        for _mode in ("standard", "kronecker", "byte")
+    }
+    for _mode, _sample in large_samples_cmp.items():
+        print(_mode, repr(_sample[:260]))
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo_cmp):
+    mo_cmp.md("""
+    ### FineWeb-Edu: recorded three-seed comparison
+
+    The models share 20 MB of distinct training documents and 2 MB of held-out
+    documents. Each sees 60 MB of sampled raw-byte training exposure; the body is
+    8 layers wide 384 with a 128-position context. Lower bits/byte is better.
+
+    | Model | Parameters | Mean validation bits/byte ↓ |
+    |---|---:|---:|
+    | Standard BPE | 17.39M | 1.717 |
+    | Kronecker input + BPE head | 18.96M | 1.729 |
+    | Parallel byte head | 17.40M | 3.899 |
+
+    For seed 7, validation changed as training continued:
+
+    | MB seen | Standard | Kronecker input | Byte head |
+    |---:|---:|---:|---:|
+    | 10 | 2.177 | 2.081 | 4.073 |
+    | 30 | 1.870 | 1.835 | 3.975 |
+    | 60 | 1.723 | 1.730 | 3.893 |
+
+    The byte head predicts every position of the next 16-byte chunk from the
+    same previous-chunk state. It cannot condition a later byte on an earlier
+    byte of that new chunk. These are short, exploratory runs, not a reproduction
+    of the paper; segmentation differs as well as the head.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo_cmp):
+    mo_cmp.md("""
+    ## Capacity and data scale-up
+
+    **Objective:** Test whether the byte model's gap shrinks with more distinct text, more training exposure, and a larger Transformer. We grow training text from 20 MB to 100 MB while keeping the **same validation documents**. A 17M-parameter byte model and a 91M-parameter byte model are checked at matched byte budgets; the BPE-head models are rerun to 60 MB as references.
+
+    The first cells rebuild the data streams. The shorter control runs use `train_scaleup_cmp`; the large byte run uses a session object so successive cells can advance the **same** model and optimizer without one long notebook execution.
+    """)
+    return
+
+
+@app.cell
+def _(build_large_data_cmp, large_data_cmp):
+    # Expand distinct training text while preserving the original held-out sample.
+    extended_data_cmp = build_large_data_cmp(
+        train_limit=100_000_000, val_limit=2_000_000,
+        vocab_size=8192, chunk_bytes=16,
+    )
+    assert extended_data_cmp["val_docs"] == large_data_cmp["val_docs"]
+    print(
+        "Extended FineWeb-Edu:", len(extended_data_cmp["train_docs"]), "train documents,",
+        len(extended_data_cmp["train_chunks"]), "byte chunks; validation unchanged."
+    )
+    return (extended_data_cmp,)
+
+
+@app.cell
+def _(extended_data_cmp, prepare_streams_cmp):
+    extended_streams_cmp = prepare_streams_cmp(extended_data_cmp, "cuda")
+    print(
+        "Extended GPU streams:",
+        tuple(extended_streams_cmp["train_bpe"].shape),
+        tuple(extended_streams_cmp["train_byte"][0].shape),
+    )
+    return (extended_streams_cmp,)
+
+
+@app.cell
+def _(
+    SmallLanguageModelCmp,
+    evaluate_cmp,
+    math_cmp,
+    time_cmp,
+    torch_cmp,
+    train_until_cmp,
+):
+    def train_scaleup_cmp(
+        mode, streams, data, *, width, layers, heads,
+        checkpoints=(60_000_000, 150_000_000, 300_000_000),
+        seed=7, context=128, batch_size=16,
+    ):
+        """Compare model capacity on a shared corpus and held-out set."""
+        from pathlib import Path
+        from safetensors.torch import save_file
+
+        torch_cmp.manual_seed(seed)
+        torch_cmp.cuda.manual_seed_all(seed)
+        device = streams["codec_table"].device
+        model = SmallLanguageModelCmp(
+            mode=mode, vocab_size=data["vocab_size"],
+            codec_table=streams["codec_table"] if mode == "kronecker" else None,
+            width=width, layers=layers, heads=heads,
+            context=context, chunk_bytes=data["chunk_bytes"],
+        ).to(device)
+        optimizer = torch_cmp.optim.AdamW(
+            model.parameters(), lr=3e-4, weight_decay=0.1
+        )
+        output_dir = Path("/marimo/kronecker-scaleup-2026-09-21")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{mode}-w{width}-l{layers}-seed{seed}"
+        trace = []
+        bytes_seen = steps = 0
+        evaluation_seconds = 0.0
+        torch_cmp.cuda.synchronize()
+        started = time_cmp.perf_counter()
+
+        for target_bytes in checkpoints:
+            bytes_seen, steps, _ = train_until_cmp(
+                model, optimizer, streams, context=context, batch_size=batch_size,
+                target_bytes=target_bytes, bytes_seen=bytes_seen, steps=steps,
+            )
+
+            torch_cmp.cuda.synchronize()
+            eval_started = time_cmp.perf_counter()
+            val_nats, val_bytes = evaluate_cmp(
+                model, streams, context=context, batch_size=batch_size
+            )
+            evaluation_seconds += time_cmp.perf_counter() - eval_started
+            point = {
+                "bytes_seen": bytes_seen, "steps": steps,
+                "val_bpb": val_nats / math_cmp.log(2), "val_bytes": val_bytes,
+                "train_seconds": time_cmp.perf_counter() - started - evaluation_seconds,
+            }
+            trace.append(point)
+            weights_path = output_dir / f"{name}-{target_bytes // 1_000_000}MB.safetensors"
+            save_file(
+                {key: value.detach().cpu().contiguous()
+                 for key, value in model.state_dict().items()},
+                str(weights_path),
+            )
+            print(
+                f"{name}: {bytes_seen / 1e6:.0f} MB seen, "
+                f"{point['val_bpb']:.3f} validation bits/byte, "
+                f"{point['train_seconds']:.1f}s training",
+                flush=True,
+            )
+
+        return {
+            "mode": mode, "seed": seed, "parameters": sum(
+                parameter.numel() for parameter in model.parameters()
+            ),
+            "width": width, "layers": layers, "heads": heads,
+            "trace": trace, "model": model,
+        }
+
+    return (train_scaleup_cmp,)
+
+
+@app.cell
+def _(
+    SmallLanguageModelCmp,
+    evaluate_cmp,
+    math_cmp,
+    time_cmp,
+    torch_cmp,
+    train_until_cmp,
+):
+    class ByteScaleupSessionCmp:
+        """Train a byte model in short notebook steps, preserving optimizer state."""
+
+        def __init__(self, streams, data, *, seed=7, width=768, layers=12, heads=12):
+            from pathlib import Path
+
+            torch_cmp.manual_seed(seed)
+            torch_cmp.cuda.manual_seed_all(seed)
+            self.streams = streams
+            self.device = streams["codec_table"].device
+            self.context = 128
+            self.batch_size = 16
+            self.model = SmallLanguageModelCmp(
+                mode="byte", vocab_size=data["vocab_size"],
+                width=width, layers=layers, heads=heads, context=self.context,
+                chunk_bytes=data["chunk_bytes"],
+            ).to(self.device)
+            self.optimizer = torch_cmp.optim.AdamW(
+                self.model.parameters(), lr=3e-4, weight_decay=0.1
+            )
+            self.output_dir = Path("/marimo/kronecker-scaleup-2026-09-21")
+            self.checkpoint_name = f"byte-w{width}-l{layers}-seed{seed}"
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.bytes_seen = 0
+            self.steps = 0
+            self.train_seconds = 0.0
+            self.trace = []
+
+        def advance(self, target_bytes):
+            from safetensors.torch import save_file
+
+            self.model.train()
+            torch_cmp.cuda.synchronize()
+            started = time_cmp.perf_counter()
+            self.bytes_seen, self.steps, _ = train_until_cmp(
+                self.model, self.optimizer, self.streams,
+                context=self.context, batch_size=self.batch_size,
+                target_bytes=target_bytes, bytes_seen=self.bytes_seen,
+                steps=self.steps,
+            )
+
+            torch_cmp.cuda.synchronize()
+            self.train_seconds += time_cmp.perf_counter() - started
+            val_nats, val_bytes = evaluate_cmp(
+                self.model, self.streams,
+                context=self.context, batch_size=self.batch_size,
+            )
+            point = {
+                "bytes_seen": self.bytes_seen, "steps": self.steps,
+                "val_bpb": val_nats / math_cmp.log(2),
+                "val_bytes": val_bytes, "train_seconds": self.train_seconds,
+            }
+            self.trace.append(point)
+            path = self.output_dir / f"{self.checkpoint_name}-{target_bytes // 1_000_000}MB.safetensors"
+            save_file(
+                {key: value.detach().cpu().contiguous()
+                 for key, value in self.model.state_dict().items()},
+                str(path),
+            )
+            print(
+                f"{self.checkpoint_name}: {self.bytes_seen / 1e6:.0f} MB seen, "
+                f"{point['val_bpb']:.3f} validation bits/byte, "
+                f"{self.train_seconds:.1f}s training",
+                flush=True,
+            )
+            return point
+
+
+    return (ByteScaleupSessionCmp,)
+
+
+@app.cell
+def byte_control_init_cmp(
+    ByteScaleupSessionCmp,
+    extended_data_cmp,
+    extended_streams_cmp,
+):
+    byte_control_session_cmp = ByteScaleupSessionCmp(
+        extended_streams_cmp, extended_data_cmp,
+        width=384, layers=8, heads=6,
+    )
+    byte_control_60_cmp = byte_control_session_cmp.advance(60_000_000)
+    return byte_control_60_cmp, byte_control_session_cmp
+
+
+@app.cell
+def _(byte_control_60_cmp, byte_control_session_cmp):
+    assert byte_control_60_cmp["bytes_seen"] >= 60_000_000
+    byte_control_150_cmp = byte_control_session_cmp.advance(150_000_000)
+    return (byte_control_150_cmp,)
+
+
+@app.cell
+def _(byte_control_150_cmp, byte_control_session_cmp):
+    assert byte_control_150_cmp["bytes_seen"] >= 150_000_000
+    byte_control_225_cmp = byte_control_session_cmp.advance(225_000_000)
+    return (byte_control_225_cmp,)
+
+
+@app.cell
+def _(byte_control_225_cmp, byte_control_session_cmp):
+    assert byte_control_225_cmp["bytes_seen"] >= 225_000_000
+    byte_control_300_cmp = byte_control_session_cmp.advance(300_000_000)
+    return (byte_control_300_cmp,)
+
+
+@app.cell
+def _(byte_control_300_cmp, byte_control_session_cmp):
+    assert byte_control_300_cmp["bytes_seen"] >= 300_000_000
+    byte_control_scaleup_cmp = {
+        "mode": "byte",
+        "seed": 7,
+        "parameters": sum(p.numel() for p in byte_control_session_cmp.model.parameters()),
+        "trace": byte_control_session_cmp.trace,
+        "model": byte_control_session_cmp.model,
+    }
+    print("17M byte model complete:",
+          [(round(p["bytes_seen"] / 1e6), round(p["val_bpb"], 4))
+           for p in byte_control_scaleup_cmp["trace"]])
+    return (byte_control_scaleup_cmp,)
+
+
+@app.cell(hide_code=True)
+def _(mo_cmp):
+    mo_cmp.md("""
+    ### Advance the large byte model in stages
+
+    **Objective:** Keep one 91M model in memory while training to 60, 120, 150, 210, 270, and 300 MB seen. `ByteScaleupSessionCmp` owns the model and optimizer; each following cell calls `advance` with the next total byte budget, evaluates, and saves weights. Rerunning an `advance` cell may train further; the result table below can be read without running these cells.
+    """)
+    return
+
+
+@app.cell
+def _(ByteScaleupSessionCmp, extended_data_cmp, extended_streams_cmp):
+    byte_big_session_cmp = ByteScaleupSessionCmp(extended_streams_cmp, extended_data_cmp)
+    print(
+        "Parameters:", sum(p.numel() for p in byte_big_session_cmp.model.parameters())
+    )
+    return (byte_big_session_cmp,)
+
+
+@app.cell
+def _(byte_big_session_cmp):
+    byte_big_60_cmp = byte_big_session_cmp.advance(60_000_000)
+    return (byte_big_60_cmp,)
+
+
+@app.cell
+def _(byte_big_60_cmp, byte_big_session_cmp):
+    assert byte_big_60_cmp["bytes_seen"] >= 60_000_000
+    byte_big_120_cmp = byte_big_session_cmp.advance(120_000_000)
+    return (byte_big_120_cmp,)
+
+
+@app.cell
+def _(byte_big_120_cmp, byte_big_session_cmp):
+    assert byte_big_120_cmp["bytes_seen"] >= 120_000_000
+    byte_big_150_cmp = byte_big_session_cmp.advance(150_000_000)
+    return (byte_big_150_cmp,)
+
+
+@app.cell
+def _(byte_big_150_cmp, byte_big_session_cmp):
+    assert byte_big_150_cmp["bytes_seen"] >= 150_000_000
+    byte_big_210_cmp = byte_big_session_cmp.advance(210_000_000)
+    return (byte_big_210_cmp,)
+
+
+@app.cell
+def _(byte_big_210_cmp, byte_big_session_cmp):
+    assert byte_big_210_cmp["bytes_seen"] >= 210_000_000
+    byte_big_270_cmp = byte_big_session_cmp.advance(270_000_000)
+    return (byte_big_270_cmp,)
+
+
+@app.cell
+def _(byte_big_270_cmp, byte_big_session_cmp):
+    assert byte_big_270_cmp["bytes_seen"] >= 270_000_000
+    byte_big_300_cmp = byte_big_session_cmp.advance(300_000_000)
+    return
+
+
+@app.cell
+def _(extended_data_cmp, extended_streams_cmp, train_scaleup_cmp):
+    standard_extended_cmp = train_scaleup_cmp(
+        "standard", extended_streams_cmp, extended_data_cmp,
+        width=384, layers=8, heads=6, checkpoints=(60_000_000,),
+    )
+    return (standard_extended_cmp,)
+
+
+@app.cell
+def _(extended_data_cmp, extended_streams_cmp, train_scaleup_cmp):
+    kronecker_extended_cmp = train_scaleup_cmp(
+        "kronecker", extended_streams_cmp, extended_data_cmp,
+        width=384, layers=8, heads=6, checkpoints=(60_000_000,),
+    )
+    return (kronecker_extended_cmp,)
+
+
+@app.cell(hide_code=True)
+def _(mo_cmp):
+    mo_cmp.md("""
+    ### Does more data and capacity close the gap? Recorded result
+
+    Training text grew to **100 MB distinct**; the held-out **2 MB documents are
+    identical** to the earlier run. All rows below use seed 7, context 128,
+    batch size 16, and the same validation bits-per-raw-byte calculation.
+
+    | Model | Parameters | 60 MB seen ↓ | 300 MB seen ↓ |
+    |---|---:|---:|---:|
+    | Standard BPE | 17.39M | 1.699 | — |
+    | Kronecker input + BPE head | 18.96M | 1.683 | — |
+    | Parallel byte head | 17.40M | 3.883 | 3.678 |
+    | Parallel byte head, wider/deeper | 91.46M | 3.913 | **3.640** |
+
+    At matched 300 MB exposure, **5.3× parameters** improve the byte model by
+    only **0.038 bits/byte**. The vocabulary-head models are already below 1.7
+    after 60 MB. More capacity helps the byte model's context, but cannot remove
+    its independence assumption within a new chunk. This scale-up has one seed;
+    the BPE models were not run to 300 MB, and the changed segmentation means
+    these numbers do not isolate the output head alone.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo_cmp):
+    mo_cmp.md("""
+    ### Qualitative check
+
+    Generate from the same prompt with the four scale-up models. These snippets help explain what the loss numbers feel like in text, but the held-out bits/byte table above remains the comparison metric.
+    """)
+    return
+
+
+@app.cell
+def _(
+    byte_big_session_cmp,
+    byte_control_scaleup_cmp,
+    extended_data_cmp,
+    generate_cmp,
+    kronecker_extended_cmp,
+    standard_extended_cmp,
+):
+    scaleup_prompt_cmp = "The history of science"
+    scaleup_samples_cmp = {
+        "Standard BPE": generate_cmp(
+            standard_extended_cmp["model"], scaleup_prompt_cmp, extended_data_cmp, max_steps=50
+        ),
+        "Kronecker + BPE": generate_cmp(
+            kronecker_extended_cmp["model"], scaleup_prompt_cmp, extended_data_cmp, max_steps=50
+        ),
+        "Byte head, 17M": generate_cmp(
+            byte_control_scaleup_cmp["model"], scaleup_prompt_cmp, extended_data_cmp, max_steps=50
+        ),
+        "Byte head, 91M": generate_cmp(
+            byte_big_session_cmp.model, scaleup_prompt_cmp, extended_data_cmp, max_steps=50
+        ),
+    }
+    for _label, _sample in scaleup_samples_cmp.items():
+        print(_label, repr(_sample[:250]))
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo_cmp):
+    mo_cmp.md("""
+    ## Saved checkpoints
+
+    **Objective:** Locate the final scale-up weights without rerunning training. The archive includes the four final models, enlarged-data tokenizer, model code, and a manifest. It was uploaded to OCI object key `kronecker-comparison/2026-09-21/scaleup-final-4-models.zip`.
+
+    Archive SHA-256: `d21622b8fb54db98052b52b0638cc9bcfffb34902191f400f8cafd16d48f283f`. The upload returned HTTP 200 with a matching MD5. The supplied endpoint did not permit a read-back check; restoring it needs read-capable access. Optimizer states are not included.
     """)
     return
 

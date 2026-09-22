@@ -1,49 +1,118 @@
-# Kronecker Embeddings - Paper Implementation
+# Assignment 7: Byte-Structured Language Models
 
-This repository implements the input-embedding method proposed in
-**“Kronecker Embeddings: Byte-Level Structured Token Representations for
-Parameter-Efficient Language Models”** by Rohan Shravan.
+This submission extends
+[Kronecker Embeddings: Byte-Level Structured Token Representations for
+Parameter-Efficient Language Models](https://arxiv.org/abs/2605.29459)
+with a controlled comparison of three language-model interfaces:
 
+1. standard BPE tokens with a learned embedding and vocabulary output;
+2. Kronecker byte-position input embeddings with a BPE output; and
+3. a vocabulary-free model that predicts a parallel chunk of raw bytes.
+
+The work includes the architecture changes, training implementations, small
+language-model runs, generated samples, and validation comparisons.
+
+## Artifacts
+
+- [Rendered notebook with outputs](kronecker-implementation.html)
+- [Markdown export with code and outputs](kronecker-implementation.md)
+- [Runnable marimo notebook](kronecker-implementation.py)
+- [Flat Python script](kronecker-implementation.script.py)
+- [Original paper PDF](kronecker-embeddings-paper.pdf)
 - [Paper on arXiv](https://arxiv.org/abs/2605.29459)
-- [Paper HTML](https://arxiv.org/html/2605.29459v1)
-- [Bundled paper PDF](kronecker-embeddings-paper.pdf)
 
-The implementation is presented as an executable
-[marimo](https://marimo.io/) notebook. It constructs the same small
-decoder-only transformer with two interchangeable input pathways:
+The rendered HTML is the easiest way to review the completed work without
+rerunning training.
 
-1. a conventional learned token embedding table; and
-2. the paper's deterministic byte-position Kronecker codec followed by a
-   learned projection.
+## Architecture Comparison
 
-## What is implemented
+All three interfaces use the same causal Transformer body, learned
+sentence-position embeddings, normalization, and training objective where
+applicable.
 
-- GPT-2 token IDs mapped to fixed-width UTF-8 byte buffers.
-- The paper's byte-value × byte-position codec from Equation 1.
-- Length normalization and per-token z-normalization.
-- A learned `codec_dim -> d_model` projection replacing `nn.Embedding`.
-- A readable loop implementation and a vectorized `scatter_add_` version.
-- Numerical verification that both codec implementations agree.
-- A controlled standard-vs.-Kronecker comparison using the same transformer
-  body, positional embeddings, normalization, and output head.
-- Explanations of the mathematics, tensor shapes, parameter counts, and model
-  data flow, supported by SVG diagrams.
+| Model | Input representation | Prediction |
+|---|---|---|
+| Standard BPE | Learned BPE token embedding | BPE vocabulary softmax |
+| Kronecker input | Byte-value by byte-position codec, then learned projection | BPE vocabulary softmax |
+| Vocabulary-free byte model | Codec of UTF-8 byte chunks, then learned projection | Parallel byte and chunk-length distributions |
 
-## Scope
+The Kronecker codec marks the coordinate `byte_value * P + byte_position`,
+scales active positions by `1 / sqrt(length)`, and normalizes each code before
+the learned projection.
 
-This is a focused implementation and teaching companion for the paper's core
-embedding method. The included tiny models are intentionally untrained, so the
-repository does not reproduce the paper's multi-billion-token training runs or
-benchmark claims. It isolates the architectural change and demonstrates that
-both embedding pathways execute end to end.
+The byte model predicts every byte position in the next chunk from the same
+previous-chunk state. Its loss combines byte cross entropy with a chunk-length
+cross entropy, then divides by the number of real target bytes.
 
-## Run locally
+## Training Results
 
-Install dependencies and open the notebook:
+Lower validation bits per raw byte is better.
+
+### Tiny Shakespeare Pilot
+
+Three seeds, 10 MB sampled training bytes per run, 3 layers, width 128.
+
+| Model | Parameters | Mean validation bits/byte |
+|---|---:|---:|
+| Standard BPE | 1.13M | 2.244 |
+| Kronecker input + BPE head | 1.52M | 2.238 |
+| Parallel byte head | 1.39M | 3.878 |
+
+### FineWeb-Edu Comparison
+
+Three seeds, 20 MB distinct training documents, 60 MB sampled training bytes,
+2 MB held out, 8 layers, width 384.
+
+| Model | Parameters | Mean validation bits/byte |
+|---|---:|---:|
+| Standard BPE | 17.39M | 1.717 |
+| Kronecker input + BPE head | 18.96M | 1.729 |
+| Parallel byte head | 17.40M | 3.899 |
+
+### Capacity and Data Scale-Up
+
+The scale-up uses 100 MB distinct training documents and the same 2 MB
+validation set. The BPE controls stop at 60 MB; the byte models continue to
+300 MB. This scale-up uses seed 7.
+
+| Model | Parameters | 60 MB seen | 300 MB seen |
+|---|---:|---:|---:|
+| Standard BPE | 17.39M | 1.699 | not run |
+| Kronecker input + BPE head | 18.96M | 1.683 | not run |
+| Parallel byte head | 17.40M | 3.883 | 3.678 |
+| Parallel byte head, wider and deeper | 91.46M | 3.913 | **3.640** |
+
+Kronecker input remains close to standard BPE in these runs. The
+vocabulary-free byte model is substantially worse because it predicts a whole
+chunk in parallel and cannot condition later bytes in that chunk on earlier
+ones. Increasing capacity from 17.40M to 91.46M improves the 300 MB byte
+result by only 0.038 bits/byte.
+
+These are small, exploratory training runs. They do not reproduce the paper's
+large-scale training regime, and the byte experiment changes segmentation as
+well as the output head.
+
+## Checkpoints
+
+The final four scale-up models, enlarged-data tokenizer, model code, and
+manifest were archived at OCI object key
+`kronecker-comparison/2026-09-21/scaleup-final-4-models.zip`.
+
+Archive SHA-256:
+`d21622b8fb54db98052b52b0638cc9bcfffb34902191f400f8cafd16d48f283f`
+
+The upload returned HTTP 200 with a matching MD5. The supplied endpoint did
+not permit a read-back check. Optimizer states are not included.
+
+## Run Locally
+
+The training cells expect a CUDA GPU and download SmolLM FineWeb-Edu through
+Hugging Face Datasets.
 
 ```bash
 uv sync
 uv run marimo edit kronecker-implementation.py
 ```
 
-The SVG diagrams used by the notebook are stored in [`assets/`](assets/).
+The recorded result tables can be read from the HTML or Markdown exports
+without retraining.

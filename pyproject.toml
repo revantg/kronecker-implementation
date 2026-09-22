@@ -1,12 +1,14 @@
 [project]
 name = "kronecker-implementation"
 version = "0.1.0"
-description = "An educational comparison of conventional and Kronecker token embeddings"
+description = "Three-architecture comparison of BPE, Kronecker input, and raw-byte language models"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "datasets>=4.1.0",
     "marimo>=0.24.2",
-    "tiktoken>=0.14.0",
+    "safetensors>=0.7.0",
+    "tokenizers>=0.22.0",
     "torch>=2.14.0",
 ]
 
